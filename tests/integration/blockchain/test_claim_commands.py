@@ -1400,7 +1400,7 @@ class StreamCommands(ClaimTestCase):
         self.assertEqual(1, blocked['total'])
         self.assertEqual(1, len(blocked['channels']))
         self.assertEqual(1, blocked['channels'][0]['blocked'])
-        self.assertTrue(blocked['channels'][0]['channel']['short_url'].startswith('lbry://@filtering#'))
+        self.assertTrue(blocked['channels'][0]['channel']['short_url'].startswith('lbry://@filtering:'))
 
         # same search, but details omitted by 'no_totals'
         last_result = result
@@ -1414,7 +1414,7 @@ class StreamCommands(ClaimTestCase):
         self.assertEqual(1, filtered['total'])
         self.assertEqual(1, len(filtered['channels']))
         self.assertEqual(1, filtered['channels'][0]['blocked'])
-        self.assertTrue(filtered['channels'][0]['channel']['short_url'].startswith('lbry://@filtering#'))
+        self.assertTrue(filtered['channels'][0]['channel']['short_url'].startswith('lbry://@filtering:'))
 
         # same search, but details omitted by 'no_totals'
         last_result = result
@@ -1444,7 +1444,7 @@ class StreamCommands(ClaimTestCase):
         error = (await self.resolve('lbry://@some_channel/bad_content'))['error']
         self.assertEqual(error['name'], 'BLOCKED')
         self.assertTrue(error['text'].startswith("Resolve of 'lbry://@some_channel/bad_content' was censored"))
-        self.assertTrue(error['censor']['short_url'].startswith('lbry://@blocking#'))
+        self.assertTrue(error['censor']['short_url'].startswith('lbry://@blocking:'))
 
         # a filtered/blocked channel impacts all content inside it
         bad_channel_id = self.get_claim_id(
@@ -1472,7 +1472,7 @@ class StreamCommands(ClaimTestCase):
         self.assertEqual(3, filtered['total'])
         self.assertEqual(1, len(filtered['channels']))
         self.assertEqual(3, filtered['channels'][0]['blocked'])
-        self.assertTrue(filtered['channels'][0]['channel']['short_url'].startswith('lbry://@filtering#'))
+        self.assertTrue(filtered['channels'][0]['channel']['short_url'].startswith('lbry://@filtering:'))
 
         # same search, but details omitted by 'no_totals'
         last_result = result
