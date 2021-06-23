@@ -231,6 +231,8 @@ class WalletManager:
 
     async def reset(self):
         self.ledger.config = {
+            'use_go_hub': True,
+            'first_search': True,
             'auto_connect': True,
             'explicit_servers': [],
             'default_servers': Config.lbryum_servers.default,
