@@ -1452,6 +1452,7 @@ class StreamCommands(ClaimTestCase):
         self.assertEqual(resolved['newstuff-again']['reposted_claim']['name'], 'newstuff')
 
     async def test_filtering_channels_for_removing_content(self):
+        log.warning("kjhg")
         await self.channel_create('@some_channel', '0.1')
         await self.stream_create('good_content', '0.1', channel_name='@some_channel', tags=['good'])
         bad_content_id = self.get_claim_id(

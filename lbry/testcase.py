@@ -132,7 +132,8 @@ class AsyncioTestCase(unittest.TestCase):
 
             with outcome.testPartExecutor(self):
                 self.setUp()
-                self.loop.run_until_complete(self.asyncSetUp())
+                if self.asyncSetUp is not None:
+                    self.loop.run_until_complete(self.asyncSetUp())
             if outcome.success:
                 outcome.expecting_failure = expecting_failure
                 with outcome.testPartExecutor(self, isTest=True):

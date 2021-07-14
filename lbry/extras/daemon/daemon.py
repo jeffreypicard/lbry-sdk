@@ -2731,7 +2731,9 @@ class Daemon(metaclass=JSONRPCServerType):
 
         Returns: {Transaction}
         """
+        log.warning("ASDF")
         wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
+        log.warning("ASDF")
         assert not wallet.is_locked, "Cannot spend funds with locked wallet, unlock first."
         account = wallet.get_account_or_default(account_id)
         funding_accounts = wallet.get_accounts_or_all(funding_account_ids)
@@ -2739,6 +2741,7 @@ class Daemon(metaclass=JSONRPCServerType):
         amount = self.get_dewies_or_error('bid', bid, positive_value=True)
         claim_address = await self.get_receiving_address(claim_address, account)
 
+        log.warning("ASDF")
         existing_channels = await self.ledger.get_channels(accounts=wallet.accounts, claim_name=name)
         if len(existing_channels) > 0:
             if not allow_duplicate_name:
@@ -2747,6 +2750,7 @@ class Daemon(metaclass=JSONRPCServerType):
                     f"Use --allow-duplicate-name flag to override."
                 )
 
+        log.warning("ASDF")
         claim = Claim()
         claim.channel.update(**kwargs)
         tx = await Transaction.claim_create(
@@ -2756,6 +2760,7 @@ class Daemon(metaclass=JSONRPCServerType):
         await txo.generate_channel_private_key()
 
         await tx.sign(funding_accounts)
+        log.warning("ASDF")
 
         if not preview:
             account.add_channel_private_key(txo.private_key)

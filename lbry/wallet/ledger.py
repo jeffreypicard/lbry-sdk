@@ -339,6 +339,7 @@ class Ledger(metaclass=LedgerRegistry):
         await self.network.on_connected.first
         async with self._header_processing_lock:
             await self._update_tasks.add(self.initial_headers_sync())
+            # await self._update_tasks.add(self.network.client.height_task_func("asdf"))
         self.network.on_connected.listen(self.join_network)
         asyncio.ensure_future(self.join_network())
         await fully_synced

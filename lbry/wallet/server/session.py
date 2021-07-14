@@ -424,6 +424,11 @@ class SessionManager:
         # Paranoia: a reorg could race and leave db_height lower
         height = min(height, self.db.db_height)
         electrum, raw = await self._electrum_and_raw_headers(height)
+        # async with grpc.aio.insecure_channel(server) as channel:
+        #     stub = hub_pb2_grpc.HubStub(channel)
+        #     response = await stub.SubscribeHeaders(hub_pb2_grpc.hub__pb2.BlockRequest(""))
+        #     return response
+
         self.hsub_results = (electrum, {'hex': raw.hex(), 'height': height})
         self.notified_height = height
 

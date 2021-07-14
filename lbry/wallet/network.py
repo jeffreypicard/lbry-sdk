@@ -8,8 +8,9 @@ from collections import defaultdict
 from typing import Dict, Optional, Tuple
 import aiohttp
 import grpc
-from lbry.schema.types.v2 import hub_pb2_grpc
+from lbry.schema.types.v2 import hub_pb2_grpc, hub_pb2
 from lbry.schema.types.v2.hub_pb2 import SearchRequest
+import lbry.schema.types.v2.result_pb2 as result__pb2
 
 from lbry import __version__
 from lbry.utils import resolve_host
@@ -34,6 +35,7 @@ class ClientSession(BaseClientSession):
         self.connection_latency: Optional[float] = None
         self._response_samples = 0
         self.pending_amount = 0
+        self.height_task: Optional[asyncio.Task] = None
 
     @property
     def available(self):
@@ -44,6 +46,26 @@ class ClientSession(BaseClientSession):
         if not self.transport:
             return None
         return self.transport.get_extra_info('peername')
+
+    async def height_task_func(self, server) -> None:
+        try:
+            async with grpc.aio.insecure_channel('localhost:50051') as channel:
+                stub = hub_pb2_grpc.HubStub(channel)
+
+                stream = stub.SubscribeHeaders(hub_pb2.BlockRequest())
+                res = await stream.read()
+                return res
+                # print("lookping")
+                # async for res in stream:
+                #     print(res)
+                #     self.network.remote_height = res.height
+
+        except Exception as e:
+            log.warning(str(e))
+        finally:
+            self.height_task = None
+            await channel.close()
+            return
 
     async def send_timed_server_version_request(self, args=(), timeout=None):
         timeout = timeout or self.timeout
@@ -107,6 +129,8 @@ class ClientSession(BaseClientSession):
         return response
 
     async def keepalive_loop(self, timeout=3, max_idle=60):
+        #if not self.height_task:
+        #    self.height_task = asyncio.get_event_loop().create_task(self.height_task_func("asdf"))
         try:
             while True:
                 now = perf_counter()
@@ -141,6 +165,9 @@ class ClientSession(BaseClientSession):
         self.response_time = None
         self.connection_latency = None
         self._response_samples = 0
+        if self.height_task:
+            self.height_task.cancel()
+        self.height_task = None
         # self._on_disconnect_controller.add(True)
         if self.network:
             self.network.disconnect()
@@ -206,7 +233,7 @@ class Network:
         if not self.running:
             self.running = True
             self.aiohttp_session = aiohttp.ClientSession()
-            self.on_header.listen(self._update_remote_height)
+            # self.on_header.listen(self._update_remote_height)
             self.on_hub.listen(self._update_hubs)
             self._loop_task = asyncio.create_task(self.network_loop())
             self._urgent_need_reconnect.set()
@@ -307,6 +334,7 @@ class Network:
                 client._close()
         return
 
+
     async def network_loop(self):
         sleep_delay = 30
         while self.running:
@@ -330,6 +358,9 @@ class Network:
                 await self._update_hubs(await client.send_request('server.peers.subscribe', []))
                 log.info("subscribe to headers %s:%i", *client.server)
                 self._update_remote_height((await self.subscribe_headers(),))
+                #if not self.client.height_task or self.client.height_task.done():
+                #    self.client.height_task = asyncio.create_task(self.client.height_task_func("asdf"))
+                    #self.client.height_task.cancel()
                 self._on_connected_controller.add(True)
                 server_str = "%s:%i" % client.server
                 log.info("maintaining connection to spv server %s", server_str)
@@ -361,7 +392,6 @@ class Network:
         self.disconnect()
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
-        self._loop_task = None
         if self.aiohttp_session:
             await self.aiohttp_session.close()
             self.aiohttp_session = None
@@ -394,8 +424,23 @@ class Network:
 
         raise asyncio.CancelledError()  # if we got here, we are shutting down
 
+    async def _update_remote_height2(self, header_args):
+        try:
+            #header = await asyncio.wait(header_args)
+            #header = await header_args
+            log.warning(header_args)
+            x = await header_args
+            self.remote_height = x.height
+            log.warning(self.remote_height)
+        except grpc.aio._call.AioRpcError:
+            log.warning("ASDF")
+            pass
+        except Exception as e:
+            log.warning(str(e))
+            pass
+
     def _update_remote_height(self, header_args):
-        self.remote_height = header_args[0]["height"]
+        self.remote_height = header_args[0]['height']
 
     async def _update_hubs(self, hubs):
         if hubs and hubs != ['']:
@@ -437,6 +482,21 @@ class Network:
 
     def broadcast(self, raw_transaction):
         return self.rpc('blockchain.transaction.broadcast', [raw_transaction], True)
+
+    async def subscribe_headers2(self, server):
+        # log.warning("HERE!!!")
+        try:
+            async with grpc.aio.insecure_channel(server) as channel:
+                log.warning("ASDF")
+                stub = hub_pb2_grpc.HubStub(channel)
+                response = stub.SubscribeHeaders(hub_pb2_grpc.hub__pb2.BlockRequest())
+                return response
+                #async for response in stub.SubscribeHeaders(hub_pb2_grpc.hub__pb2.BlockRequest()):
+                #    log.warning("ASDF")
+                #    yield response
+        except Exception:
+            log.warning("SA")
+
 
     def subscribe_headers(self):
         return self.rpc('blockchain.headers.subscribe', [True], True)

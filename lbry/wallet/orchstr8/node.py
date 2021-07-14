@@ -346,7 +346,7 @@ class BlockchainNode:
             self.daemon_bin,
             f'-datadir={self.data_path}', '-printtoconsole', '-regtest', '-server', '-txindex',
             f'-rpcuser={self.rpcuser}', f'-rpcpassword={self.rpcpassword}', f'-rpcport={self.rpcport}',
-            f'-port={self.peerport}'
+            f'-port={self.peerport}', f'-zmqpubhashblock=tcp://127.0.0.1:28332', f'-zmqpubhashblockheader=tcp://127.0.0.1:28333'
         ]
         self.log.info(' '.join(command))
         while not self.stopped:
@@ -486,7 +486,7 @@ class HubProcess(asyncio.SubprocessProtocol):
 class HubNode:
 
     def __init__(self, url, daemon, cli):
-        self.debug = False
+        self.debug = True
 
         self.latest_release_url = url
         self.project_dir = os.path.dirname(os.path.dirname(__file__))
