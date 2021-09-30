@@ -1,6 +1,6 @@
 import os
 
-import apsw
+import sqlite3
 from typing import Union, Tuple, Set, List
 from itertools import chain
 from decimal import Decimal
@@ -21,6 +21,7 @@ from .common import CLAIM_TYPES, STREAM_TYPES, COMMON_TAGS, INDEXED_LANGUAGES
 from lbry.wallet.server.db.elasticsearch import SearchIndex
 
 ATTRIBUTE_ARRAY_MAX_LENGTH = 100
+sqlite3.enable_callback_tracebacks(True)
 
 
 class SQLDB:
@@ -233,21 +234,14 @@ class SQLDB:
         self.pending_deletes = set()
 
     def open(self):
-        self.db = apsw.Connection(
-            self._db_path,
-            flags=(
-                apsw.SQLITE_OPEN_READWRITE |
-                apsw.SQLITE_OPEN_CREATE |
-                apsw.SQLITE_OPEN_URI
-            )
-        )
-        def exec_factory(cursor, statement, bindings):
-            tpl = namedtuple('row', (d[0] for d in cursor.getdescription()))
-            cursor.setrowtrace(lambda cursor, row: tpl(*row))
-            return True
-        self.db.setexectrace(exec_factory)
-        self.execute(self.PRAGMAS)
-        self.execute(self.CREATE_TABLES_QUERY)
+        self.db = sqlite3.connect(self._db_path, isolation_level=None, check_same_thread=False, uri=True)
+
+        def namedtuple_factory(cursor, row):
+            Row = namedtuple('Row', (d[0] for d in cursor.description))
+            return Row(*row)
+        self.db.row_factory = namedtuple_factory
+        self.db.executescript(self.PRAGMAS)
+        self.db.executescript(self.CREATE_TABLES_QUERY)
         register_canonical_functions(self.db)
         self.blocked_streams = {}
         self.blocked_channels = {}
@@ -319,10 +313,10 @@ class SQLDB:
         return f"DELETE FROM {table} WHERE {where}", values
 
     def execute(self, *args):
-        return self.db.cursor().execute(*args)
+        return self.db.execute(*args)
 
     def executemany(self, *args):
-        return self.db.cursor().executemany(*args)
+        return self.db.executemany(*args)
 
     def begin(self):
         self.execute('begin;')
@@ -620,7 +614,7 @@ class SQLDB:
                 channel_hash IN ({','.join('?' for _ in changed_channel_keys)}) AND
                 signature IS NOT NULL
             """
-            for affected_claim in self.execute(sql, changed_channel_keys.keys()):
+            for affected_claim in self.execute(sql, list(changed_channel_keys.keys())):
                 if affected_claim.claim_hash not in signables:
                     claim_updates.append({
                         'claim_hash': affected_claim.claim_hash,
@@ -677,7 +671,7 @@ class SQLDB:
                     signature_valid=CASE WHEN signature IS NOT NULL THEN 0 END,
                     channel_join=NULL, canonical_url=NULL
                 WHERE channel_hash IN ({','.join('?' for _ in spent_claims)})
-                """, spent_claims
+                """, list(spent_claims)
             )
         sub_timer.stop()
 
@@ -802,12 +796,13 @@ class SQLDB:
 
     def update_claimtrie(self, height, changed_claim_hashes, deleted_names, timer):
         r = timer.run
+        binary_claim_hashes = list(changed_claim_hashes)
 
         r(self._calculate_activation_height, height)
-        r(self._update_support_amount, changed_claim_hashes)
+        r(self._update_support_amount, binary_claim_hashes)
 
-        r(self._update_effective_amount, height, changed_claim_hashes)
-        r(self._perform_overtake, height, changed_claim_hashes, list(deleted_names))
+        r(self._update_effective_amount, height, binary_claim_hashes)
+        r(self._perform_overtake, height, binary_claim_hashes, list(deleted_names))
 
         r(self._update_effective_amount, height)
         r(self._perform_overtake, height, [], [])
@@ -823,31 +818,42 @@ class SQLDB:
                claimtrie.last_take_over_height,
                (select group_concat(tag, ',,') from tag where tag.claim_hash in (claim.claim_hash, claim.reposted_claim_hash)) as tags,
                (select group_concat(language, ' ') from language where language.claim_hash in (claim.claim_hash, claim.reposted_claim_hash)) as languages,
-               (select cr.has_source from claim cr where cr.claim_hash = claim.reposted_claim_hash) as reposted_has_source,
-               (select cr.claim_type from claim cr where cr.claim_hash = claim.reposted_claim_hash) as reposted_claim_type,
+               cr.has_source as reposted_has_source,
+               cr.claim_type  as reposted_claim_type,
+               cr.stream_type as reposted_stream_type,
+               cr.media_type as reposted_media_type,
+               cr.duration as reposted_duration,
+               cr.fee_amount as reposted_fee_amount,
+               cr.fee_currency as reposted_fee_currency,
                claim.*
-        FROM claim LEFT JOIN claimtrie USING (claim_hash)
+        FROM claim LEFT JOIN claimtrie USING (claim_hash) LEFT JOIN claim cr ON cr.claim_hash=claim.reposted_claim_hash
         WHERE claim.claim_hash in (SELECT claim_hash FROM changelog)
         """
         for claim in self.execute(query):
             claim = claim._asdict()
             id_set = set(filter(None, (claim['claim_hash'], claim['channel_hash'], claim['reposted_claim_hash'])))
             claim['censor_type'] = 0
-            claim['censoring_channel_hash'] = None
+            censoring_channel_hash = None
             claim['has_source'] = bool(claim.pop('reposted_has_source') or claim['has_source'])
+            claim['stream_type'] = claim.pop('reposted_stream_type') or claim['stream_type']
+            claim['media_type'] = claim.pop('reposted_media_type') or claim['media_type']
+            claim['fee_amount'] = claim.pop('reposted_fee_amount') or claim['fee_amount']
+            claim['fee_currency'] = claim.pop('reposted_fee_currency') or claim['fee_currency']
+            claim['duration'] = claim.pop('reposted_duration') or claim['duration']
             for reason_id in id_set:
                 if reason_id in self.blocked_streams:
                     claim['censor_type'] = 2
-                    claim['censoring_channel_hash'] = self.blocked_streams.get(reason_id)
+                    censoring_channel_hash = self.blocked_streams.get(reason_id)
                 elif reason_id in self.blocked_channels:
                     claim['censor_type'] = 2
-                    claim['censoring_channel_hash'] = self.blocked_channels.get(reason_id)
+                    censoring_channel_hash = self.blocked_channels.get(reason_id)
                 elif reason_id in self.filtered_streams:
                     claim['censor_type'] = 1
-                    claim['censoring_channel_hash'] = self.filtered_streams.get(reason_id)
+                    censoring_channel_hash = self.filtered_streams.get(reason_id)
                 elif reason_id in self.filtered_channels:
                     claim['censor_type'] = 1
-                    claim['censoring_channel_hash'] = self.filtered_channels.get(reason_id)
+                    censoring_channel_hash = self.filtered_channels.get(reason_id)
+            claim['censoring_channel_id'] = censoring_channel_hash[::-1].hex() if censoring_channel_hash else None
 
             claim['tags'] = claim['tags'].split(',,') if claim['tags'] else []
             claim['languages'] = claim['languages'].split(' ') if claim['languages'] else []

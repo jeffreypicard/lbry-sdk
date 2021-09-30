@@ -750,7 +750,7 @@ class Ledger(metaclass=LedgerRegistry):
             ))[1] if record['history'] else []
             for txid, local_height in local_history:
                 if txid == tx.id:
-                    if local_height >= height:
+                    if local_height >= height or (local_height == 0 and height > local_height):
                         return True
                     log.warning(
                         "local history has higher height than remote for %s (%i vs %i)", txid,
@@ -768,9 +768,13 @@ class Ledger(metaclass=LedgerRegistry):
             include_is_my_output=False,
             include_sent_supports=False,
             include_sent_tips=False,
-            include_received_tips=False) -> Tuple[List[Output], dict, int, int]:
+            include_received_tips=False,
+            hub_server=False) -> Tuple[List[Output], dict, int, int]:
         encoded_outputs = await query
-        outputs = Outputs.from_base64(encoded_outputs or b'')  # TODO: why is the server returning None?
+        if hub_server:
+            outputs = Outputs.from_grpc(encoded_outputs)
+        else:
+            outputs = Outputs.from_base64(encoded_outputs or b'')  # TODO: why is the server returning None?
         txs: List[Transaction] = []
         if len(outputs.txs) > 0:
             async for tx in self.request_transactions(tuple(outputs.txs), cached=True):
@@ -887,6 +891,7 @@ class Ledger(metaclass=LedgerRegistry):
             claim_search(**kwargs), accounts,
             include_purchase_receipt=include_purchase_receipt,
             include_is_my_output=include_is_my_output,
+            hub_server=new_sdk_server is not None
         )
 
     async def get_claim_by_claim_id(self, accounts, claim_id, **kwargs) -> Output:

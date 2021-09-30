@@ -3,12 +3,14 @@ import json
 import typing
 import logging
 import asyncio
+from distutils.util import strtobool
+
 from binascii import unhexlify
 from decimal import Decimal
 from typing import List, Type, MutableSequence, MutableMapping, Optional
 
-from lbry.error import KeyFeeAboveMaxAllowedError
-from lbry.conf import Config
+from lbry.error import KeyFeeAboveMaxAllowedError, WalletNotLoadedError
+from lbry.conf import Config, NOT_SET
 
 from .dewies import dewies_to_lbc
 from .account import Account
@@ -95,7 +97,7 @@ class WalletManager:
         for wallet in self.wallets:
             if wallet.id == wallet_id:
                 return wallet
-        raise ValueError(f"Couldn't find wallet: {wallet_id}.")
+        raise WalletNotLoadedError(wallet_id)
 
     @staticmethod
     def get_balance(wallet):
@@ -181,8 +183,14 @@ class WalletManager:
         }[config.blockchain_name]
 
         ledger_config = {
+            'use_go_hub': not strtobool(os.environ.get('ENABLE_LEGACY_SEARCH') or 'yes'),
             'auto_connect': True,
+            'explicit_servers': [],
+            'hub_timeout': config.hub_timeout,
             'default_servers': config.lbryum_servers,
+            'known_hubs': config.known_hubs,
+            'jurisdiction': config.jurisdiction,
+            'concurrent_hub_requests': config.concurrent_hub_requests,
             'data_path': config.wallet_dir,
             'tx_cache_size': config.transaction_cache_size
         }
@@ -194,6 +202,10 @@ class WalletManager:
         receiving_addresses, change_addresses = cls.migrate_lbryum_to_torba(
             os.path.join(wallets_directory, 'default_wallet')
         )
+
+        if Config.lbryum_servers.is_set_to_default(config):
+            with config.update_config() as c:
+                c.lbryum_servers = NOT_SET
 
         manager = cls.from_config({
             'ledgers': {ledger_id: ledger_config},
@@ -224,10 +236,18 @@ class WalletManager:
 
     async def reset(self):
         self.ledger.config = {
+            'use_go_hub': not strtobool(os.environ.get('ENABLE_LEGACY_SEARCH') or 'yes'),
             'auto_connect': True,
-            'default_servers': self.config.lbryum_servers,
+            'explicit_servers': [],
+            'default_servers': Config.lbryum_servers.default,
+            'known_hubs': self.config.known_hubs,
+            'jurisdiction': self.config.jurisdiction,
+            'hub_timeout': self.config.hub_timeout,
+            'concurrent_hub_requests': self.config.concurrent_hub_requests,
             'data_path': self.config.wallet_dir,
         }
+        if Config.lbryum_servers.is_set(self.config):
+            self.ledger.config['explicit_servers'] = self.config.lbryum_servers
         await self.ledger.stop()
         await self.ledger.start()
 

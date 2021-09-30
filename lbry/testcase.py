@@ -18,7 +18,7 @@ from lbry.wallet import WalletManager, Wallet, Ledger, Account, Transaction
 from lbry.conf import Config
 from lbry.wallet.util import satoshis_to_coins
 from lbry.wallet.orchstr8 import Conductor
-from lbry.wallet.orchstr8.node import BlockchainNode, WalletNode
+from lbry.wallet.orchstr8.node import BlockchainNode, WalletNode, HubNode
 
 from lbry.extras.daemon.daemon import Daemon, jsonrpc_dumps_pretty
 from lbry.extras.daemon.components import Component, WalletComponent
@@ -223,6 +223,7 @@ class IntegrationTestCase(AsyncioTestCase):
         super().__init__(*args, **kwargs)
         self.conductor: Optional[Conductor] = None
         self.blockchain: Optional[BlockchainNode] = None
+        self.hub: Optional[HubNode] = None
         self.wallet_node: Optional[WalletNode] = None
         self.manager: Optional[WalletManager] = None
         self.ledger: Optional[Ledger] = None
@@ -237,7 +238,10 @@ class IntegrationTestCase(AsyncioTestCase):
         self.addCleanup(self.conductor.stop_spv)
         await self.conductor.start_wallet()
         self.addCleanup(self.conductor.stop_wallet)
+        await self.conductor.start_hub()
+        self.addCleanup(self.conductor.stop_hub)
         self.blockchain = self.conductor.blockchain_node
+        self.hub = self.conductor.hub_node
         self.wallet_node = self.conductor.wallet_node
         self.manager = self.wallet_node.manager
         self.ledger = self.wallet_node.ledger
@@ -350,7 +354,12 @@ class CommandTestCase(IntegrationTestCase):
 
         server_tmp_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, server_tmp_dir)
-        self.server_config = Config()
+        self.server_config = Config(
+            data_dir=server_tmp_dir,
+            wallet_dir=server_tmp_dir,
+            save_files=True,
+            download_dir=server_tmp_dir
+        )
         self.server_config.transaction_cache_size = 10000
         self.server_storage = SQLiteStorage(self.server_config, ':memory:')
         await self.server_storage.open()
@@ -374,6 +383,7 @@ class CommandTestCase(IntegrationTestCase):
             await daemon.stop()
 
     async def add_daemon(self, wallet_node=None, seed=None):
+        start_wallet_node = False
         if wallet_node is None:
             wallet_node = WalletNode(
                 self.wallet_node.manager_class,
@@ -381,22 +391,24 @@ class CommandTestCase(IntegrationTestCase):
                 port=self.extra_wallet_node_port
             )
             self.extra_wallet_node_port += 1
-            await wallet_node.start(self.conductor.spv_node, seed=seed)
-            self.extra_wallet_nodes.append(wallet_node)
+            start_wallet_node = True
 
         upload_dir = os.path.join(wallet_node.data_path, 'uploads')
         os.mkdir(upload_dir)
 
-        conf = Config()
-        conf.data_dir = wallet_node.data_path
-        conf.wallet_dir = wallet_node.data_path
-        conf.download_dir = wallet_node.data_path
+        conf = Config(
+            # needed during instantiation to access known_hubs path
+            data_dir=wallet_node.data_path,
+            wallet_dir=wallet_node.data_path,
+            save_files=True,
+            download_dir=wallet_node.data_path
+        )
         conf.upload_dir = upload_dir  # not a real conf setting
         conf.share_usage_data = False
         conf.use_upnp = False
         conf.reflect_streams = True
         conf.blockchain_name = 'lbrycrd_regtest'
-        conf.lbryum_servers = [('127.0.0.1', 50001)]
+        conf.lbryum_servers = [(self.conductor.spv_node.hostname, self.conductor.spv_node.port)]
         conf.reflector_servers = [('127.0.0.1', 5566)]
         conf.fixed_peers = [('127.0.0.1', 5567)]
         conf.known_dht_nodes = []
@@ -408,7 +420,13 @@ class CommandTestCase(IntegrationTestCase):
         ]
         if self.skip_libtorrent:
             conf.components_to_skip.append(LIBTORRENT_COMPONENT)
-        wallet_node.manager.config = conf
+
+        if start_wallet_node:
+            await wallet_node.start(self.conductor.spv_node, seed=seed, config=conf)
+            self.extra_wallet_nodes.append(wallet_node)
+        else:
+            wallet_node.manager.config = conf
+            wallet_node.manager.ledger.config['known_hubs'] = conf.known_hubs
 
         def wallet_maker(component_manager):
             wallet_component = WalletComponent(component_manager)
@@ -595,6 +613,12 @@ class CommandTestCase(IntegrationTestCase):
             await asyncio.wait([self.ledger.wait(tx, self.blockchain.block_expected) for tx in txs])
         return self.sout(txs)
 
+    async def blob_clean(self):
+        return await self.out(self.daemon.jsonrpc_blob_clean())
+
+    async def status(self):
+        return await self.out(self.daemon.jsonrpc_status())
+
     async def resolve(self, uri, **kwargs):
         return (await self.out(self.daemon.jsonrpc_resolve(uri, **kwargs)))[uri]
 
@@ -624,6 +648,9 @@ class CommandTestCase(IntegrationTestCase):
 
     async def transaction_list(self, *args, **kwargs):
         return (await self.out(self.daemon.jsonrpc_transaction_list(*args, **kwargs)))['items']
+
+    async def blob_list(self, *args, **kwargs):
+        return (await self.out(self.daemon.jsonrpc_blob_list(*args, **kwargs)))['items']
 
     @staticmethod
     def get_claim_id(tx):

@@ -76,6 +76,35 @@ class InputValueIsNoneError(InputValueError):
         super().__init__(f"None or null is not valid value for argument '{argument}'.")
 
 
+class ConflictingInputValueError(InputValueError):
+
+    def __init__(self, first_argument, second_argument):
+        self.first_argument = first_argument
+        self.second_argument = second_argument
+        super().__init__(f"Only '{first_argument}' or '{second_argument}' is allowed, not both.")
+
+
+class InputStringIsBlankError(InputValueError):
+
+    def __init__(self, argument):
+        self.argument = argument
+        super().__init__(f"{argument} cannot be blank.")
+
+
+class EmptyPublishedFileError(InputValueError):
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        super().__init__(f"Cannot publish empty file: {file_path}")
+
+
+class MissingPublishedFileError(InputValueError):
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        super().__init__(f"File does not exist: {file_path}")
+
+
 class ConfigurationError(BaseError):
     """
     Configuration errors.
@@ -199,6 +228,14 @@ class DataDownloadError(WalletError):
         super().__init__("Failed to download blob. *generic*")
 
 
+class PrivateKeyNotFoundError(WalletError):
+
+    def __init__(self, key, value):
+        self.key = key
+        self.value = value
+        super().__init__(f"Couldn't find private key for {key} '{value}'.")
+
+
 class ResolveError(WalletError):
 
     def __init__(self, url):
@@ -215,10 +252,10 @@ class ResolveTimeoutError(WalletError):
 
 class ResolveCensoredError(WalletError):
 
-    def __init__(self, url, censor_hash):
+    def __init__(self, url, censor_id):
         self.url = url
-        self.censor_hash = censor_hash
-        super().__init__(f"Resolve of '{url}' was censored by channel with claim id '{claim_id(censor_hash)}'.")
+        self.censor_id = censor_id
+        super().__init__(f"Resolve of '{url}' was censored by channel with claim id '{censor_id}'.")
 
 
 class KeyFeeAboveMaxAllowedError(WalletError):
@@ -242,6 +279,24 @@ class IncompatibleWalletServerError(WalletError):
         super().__init__(f"'{server}:{port}' has an incompatibly old version.")
 
 
+class TooManyClaimSearchParametersError(WalletError):
+
+    def __init__(self, key, limit):
+        self.key = key
+        self.limit = limit
+        super().__init__(f"{key} cant have more than {limit} items.")
+
+
+class AlreadyPurchasedError(WalletError):
+    """
+    allow-duplicate-purchase flag to override.
+    """
+
+    def __init__(self, claim_id_hex):
+        self.claim_id_hex = claim_id_hex
+        super().__init__(f"You already have a purchase for claim_id '{claim_id_hex}'. Use")
+
+
 class ServerPaymentInvalidAddressError(WalletError):
 
     def __init__(self, address):
@@ -261,6 +316,34 @@ class ServerPaymentFeeAboveMaxAllowedError(WalletError):
         self.daily_fee = daily_fee
         self.max_fee = max_fee
         super().__init__(f"Daily server fee of {daily_fee} exceeds maximum configured of {max_fee} LBC.")
+
+
+class WalletNotLoadedError(WalletError):
+
+    def __init__(self, wallet_id):
+        self.wallet_id = wallet_id
+        super().__init__(f"Wallet {wallet_id} is not loaded.")
+
+
+class WalletAlreadyLoadedError(WalletError):
+
+    def __init__(self, wallet_path):
+        self.wallet_path = wallet_path
+        super().__init__(f"Wallet {wallet_path} is already loaded.")
+
+
+class WalletNotFoundError(WalletError):
+
+    def __init__(self, wallet_path):
+        self.wallet_path = wallet_path
+        super().__init__(f"Wallet not found at {wallet_path}.")
+
+
+class WalletAlreadyExistsError(WalletError):
+
+    def __init__(self, wallet_path):
+        self.wallet_path = wallet_path
+        super().__init__(f"Wallet {wallet_path} already exists, use `wallet_add` to load it.")
 
 
 class BlobError(BaseError):

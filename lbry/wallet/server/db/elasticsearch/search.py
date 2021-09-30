@@ -10,14 +10,14 @@ from elasticsearch import AsyncElasticsearch, NotFoundError, ConnectionError
 from elasticsearch.helpers import async_streaming_bulk
 
 from lbry.crypto.base58 import Base58
-from lbry.error import ResolveCensoredError, claim_id as parse_claim_id
+from lbry.error import ResolveCensoredError, TooManyClaimSearchParametersError
 from lbry.schema.result import Outputs, Censor
 from lbry.schema.tags import clean_tags
 from lbry.schema.url import URL, normalize_name
 from lbry.utils import LRUCache
 from lbry.wallet.server.db.common import CLAIM_TYPES, STREAM_TYPES
 from lbry.wallet.server.db.elasticsearch.constants import INDEX_DEFAULT_SETTINGS, REPLACEMENTS, FIELDS, TEXT_FIELDS, \
-    RANGE_FIELDS
+    RANGE_FIELDS, ALL_FIELDS
 from lbry.wallet.server.util import class_logger
 
 
@@ -133,7 +133,7 @@ class SearchIndex:
             update = expand_query(claim_id__in=list(blockdict.keys()), censor_type=f"<{censor_type}")
         key = 'channel_id' if channels else 'claim_id'
         update['script'] = {
-            "source": f"ctx._source.censor_type={censor_type}; ctx._source.censoring_channel_hash=params[ctx._source.{key}]",
+            "source": f"ctx._source.censor_type={censor_type}; ctx._source.censoring_channel_id=params[ctx._source.{key}]",
             "lang": "painless",
             "params": blockdict
         }
@@ -208,7 +208,7 @@ class SearchIndex:
 
         censored = [
             result if not isinstance(result, dict) or not censor.censor(result)
-            else ResolveCensoredError(url, result['censoring_channel_hash'])
+            else ResolveCensoredError(url, result['censoring_channel_id'])
             for url, result in zip(urls, results)
         ]
         return results, censored, censor
@@ -411,7 +411,7 @@ class SearchIndex:
         txo_rows = [row for row in txo_rows if isinstance(row, dict)]
         referenced_ids = set(filter(None, map(itemgetter('reposted_claim_id'), txo_rows)))
         referenced_ids |= set(filter(None, (row['channel_id'] for row in txo_rows)))
-        referenced_ids |= set(map(parse_claim_id, filter(None, (row['censoring_channel_hash'] for row in txo_rows))))
+        referenced_ids |= set(filter(None, (row['censoring_channel_id'] for row in txo_rows)))
 
         referenced_txos = []
         if referenced_ids:
@@ -432,20 +432,22 @@ def extract_doc(doc, index):
         doc['reposted_claim_id'] = None
     channel_hash = doc.pop('channel_hash')
     doc['channel_id'] = channel_hash[::-1].hex() if channel_hash else channel_hash
-    channel_hash = doc.pop('censoring_channel_hash')
-    doc['censoring_channel_hash'] = channel_hash[::-1].hex() if channel_hash else channel_hash
+    doc['censoring_channel_id'] = doc.get('censoring_channel_id')
     txo_hash = doc.pop('txo_hash')
     doc['tx_id'] = txo_hash[:32][::-1].hex()
     doc['tx_nout'] = struct.unpack('<I', txo_hash[32:])[0]
+    doc['repost_count'] = doc.pop('reposted')
     doc['is_controlling'] = bool(doc['is_controlling'])
     doc['signature'] = (doc.pop('signature') or b'').hex() or None
     doc['signature_digest'] = (doc.pop('signature_digest') or b'').hex() or None
     doc['public_key_bytes'] = (doc.pop('public_key_bytes') or b'').hex() or None
-    doc['public_key_hash'] = (doc.pop('public_key_hash') or b'').hex() or None
-    doc['signature_valid'] = bool(doc['signature_valid'])
+    doc['public_key_id'] = (doc.pop('public_key_hash') or b'').hex() or None
+    doc['is_signature_valid'] = bool(doc['signature_valid'])
     doc['claim_type'] = doc.get('claim_type', 0) or 0
     doc['stream_type'] = int(doc.get('stream_type', 0) or 0)
     doc['has_source'] = bool(doc['has_source'])
+    doc['normalized_name'] = doc.pop('normalized')
+    doc = {key: value for key, value in doc.items() if key in ALL_FIELDS}
     return {'doc': doc, '_id': doc['claim_id'], '_index': index, '_op_type': 'update', 'doc_as_upsert': True}
 
 
@@ -463,6 +465,8 @@ def expand_query(**kwargs):
     for key, value in kwargs.items():
         key = key.replace('claim.', '')
         many = key.endswith('__in') or isinstance(value, list)
+        if many and len(value) > 2048:
+            raise TooManyClaimSearchParametersError(key, 2048)
         if many:
             key = key.replace('__in', '')
             value = list(filter(None, value))
@@ -476,6 +480,8 @@ def expand_query(**kwargs):
                     value = CLAIM_TYPES[value]
                 else:
                     value = [CLAIM_TYPES[claim_type] for claim_type in value]
+            elif key == 'stream_type':
+                value = STREAM_TYPES[value] if isinstance(value, str) else list(map(STREAM_TYPES.get, value))
             if key == '_id':
                 if isinstance(value, Iterable):
                     value = [item[::-1].hex() for item in value]
@@ -484,9 +490,8 @@ def expand_query(**kwargs):
             if not many and key in ('_id', 'claim_id') and len(value) < 20:
                 partial_id = True
             if key == 'public_key_id':
-                key = 'public_key_hash'
                 value = Base58.decode(value)[1:21].hex()
-            if key == 'signature_valid':
+            if key in ('signature_valid', 'has_source'):
                 continue  # handled later
             if key in TEXT_FIELDS:
                 key += '.keyword'
@@ -515,8 +520,6 @@ def expand_query(**kwargs):
             query['must'].append({"terms": {'claim_id.keyword': value}})
         elif key == 'media_types':
             query['must'].append({"terms": {'media_type.keyword': value}})
-        elif key == 'stream_types':
-            query['must'].append({"terms": {'stream_type': [STREAM_TYPES[stype] for stype in value]}})
         elif key == 'any_languages':
             query['must'].append({"terms": {'languages': clean_tags(value)}})
         elif key == 'any_languages':
@@ -536,12 +539,12 @@ def expand_query(**kwargs):
     if kwargs.get('has_channel_signature'):
         query['must'].append({"exists": {"field": "signature_digest"}})
         if 'signature_valid' in kwargs:
-            query['must'].append({"term": {"signature_valid": bool(kwargs["signature_valid"])}})
+            query['must'].append({"term": {"is_signature_valid": bool(kwargs["signature_valid"])}})
     elif 'signature_valid' in kwargs:
         query.setdefault('should', [])
         query["minimum_should_match"] = 1
         query['should'].append({"bool": {"must_not": {"exists": {"field": "signature_digest"}}}})
-        query['should'].append({"term": {"signature_valid": bool(kwargs["signature_valid"])}})
+        query['should'].append({"term": {"is_signature_valid": bool(kwargs["signature_valid"])}})
     if 'has_source' in kwargs:
         query.setdefault('should', [])
         query["minimum_should_match"] = 1
@@ -607,8 +610,9 @@ def expand_result(results):
         result['channel_hash'] = unhexlify(result['channel_id'])[::-1] if result['channel_id'] else None
         result['txo_hash'] = unhexlify(result['tx_id'])[::-1] + struct.pack('<I', result['tx_nout'])
         result['tx_hash'] = unhexlify(result['tx_id'])[::-1]
-        if result['censoring_channel_hash']:
-            result['censoring_channel_hash'] = unhexlify(result['censoring_channel_hash'])[::-1]
+        result['reposted'] = result.pop('repost_count')
+        result['signature_valid'] = result.pop('is_signature_valid')
+        result['normalized'] = result.pop('normalized_name')
         expanded.append(result)
     if inner_hits:
         return expand_result(inner_hits)

@@ -10,6 +10,7 @@ from google.protobuf.json_format import MessageToDict
 
 from lbry.crypto.base58 import Base58
 from lbry.constants import COIN
+from lbry.error import MissingPublishedFileError, EmptyPublishedFileError
 
 from lbry.schema.mime_types import guess_media_type
 from lbry.schema.base import Metadata, BaseMessageList
@@ -30,6 +31,17 @@ def calculate_sha384_file_hash(file_path):
         for chunk in iter(lambda: f.read(128 * sha384.block_size), b''):
             sha384.update(chunk)
     return sha384.digest()
+
+
+def country_int_to_str(country: int) -> str:
+    r = LocationMessage.Country.Name(country)
+    return r[1:] if r.startswith('R') else r
+
+
+def country_str_to_int(country: str) -> int:
+    if len(country) == 3:
+        country = 'R' + country
+    return LocationMessage.Country.Value(country)
 
 
 class Dimmensional(Metadata):
@@ -128,10 +140,10 @@ class Source(Metadata):
             self.name = os.path.basename(file_path)
             self.media_type, stream_type = guess_media_type(file_path)
             if not os.path.isfile(file_path):
-                raise Exception(f"File does not exist: {file_path}")
+                raise MissingPublishedFileError(file_path)
             self.size = os.path.getsize(file_path)
             if self.size == 0:
-                raise Exception(f"Cannot publish empty file: {file_path}")
+                raise EmptyPublishedFileError(file_path)
             self.file_hash_bytes = calculate_sha384_file_hash(file_path)
             return stream_type
 
@@ -423,14 +435,11 @@ class Language(Metadata):
     @property
     def region(self) -> str:
         if self.message.region:
-            r = LocationMessage.Country.Name(self.message.region)
-            return r[1:] if r.startswith('R') else r
+            return country_int_to_str(self.message.region)
 
     @region.setter
     def region(self, region: str):
-        if len(region) == 3:
-            region = 'R'+region
-        self.message.region = LocationMessage.Country.Value(region)
+        self.message.region = country_str_to_int(region)
 
 
 class LanguageList(BaseMessageList[Language]):

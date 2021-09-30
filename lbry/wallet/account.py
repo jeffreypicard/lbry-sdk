@@ -96,7 +96,8 @@ class AddressManager:
         return [r['address'] for r in records]
 
     async def get_or_create_usable_address(self) -> str:
-        addresses = await self.get_addresses(only_usable=True, limit=10)
+        async with self.address_generator_lock:
+            addresses = await self.get_addresses(only_usable=True, limit=10)
         if addresses:
             return random.choice(addresses)
         addresses = await self.ensure_address_gap()
@@ -249,7 +250,7 @@ class Account:
         generator_name = address_generator.get('name', HierarchicalDeterministic.name)
         self.address_generator = self.address_generators[generator_name]
         self.receiving, self.change = self.address_generator.from_dict(self, address_generator)
-        self.address_managers = {am.chain_number: am for am in {self.receiving, self.change}}
+        self.address_managers = {am.chain_number: am for am in (self.receiving, self.change)}
         self.channel_keys = channel_keys
         ledger.add_account(self)
         wallet.add_account(self)

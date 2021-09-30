@@ -43,7 +43,7 @@ setup(
         'base58==1.0.0',
         'cffi==1.13.2',
         'cryptography==2.5',
-        'protobuf==3.6.1',
+        'protobuf==3.17.2',
         'msgpack==0.6.1',
         'prometheus_client==0.7.1',
         'ecdsa==0.13.3',
@@ -51,12 +51,18 @@ setup(
         'docopt==0.6.2',
         'hachoir',
         'multidict==4.6.1',
-        'coincurve==11.0.0',
+        'coincurve==15.0.0',
         'pbkdf2==1.3',
         'attrs==18.2.0',
         'pylru==1.1.0',
-        'elasticsearch==7.10.1'
+        'elasticsearch==7.10.1',
+        'grpcio==1.38.0'
     ] + PLYVEL,
+    extras_require={
+        'torrent': ['lbry-libtorrent'],
+        'lint': ['pylint==2.10.0'],
+        'test': ['coverage'],
+    },
     classifiers=[
         'Framework :: AsyncIO',
         'Intended Audience :: Developers',

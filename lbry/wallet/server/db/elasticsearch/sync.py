@@ -5,7 +5,7 @@ import os
 from collections import namedtuple
 from multiprocessing import Process
 
-import apsw
+import sqlite3
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
 from lbry.wallet.server.env import Env
@@ -15,29 +15,38 @@ from lbry.wallet.server.db.elasticsearch.search import extract_doc, SearchIndex,
 
 async def get_all(db, shard_num, shards_total, limit=0, index_name='claims'):
     logging.info("shard %d starting", shard_num)
-    def exec_factory(cursor, statement, bindings):
-        tpl = namedtuple('row', (d[0] for d in cursor.getdescription()))
-        cursor.setrowtrace(lambda cursor, row: tpl(*row))
-        return True
 
-    db.setexectrace(exec_factory)
+    def namedtuple_factory(cursor, row):
+        Row = namedtuple('Row', (d[0] for d in cursor.description))
+        return Row(*row)
+    db.row_factory = namedtuple_factory
     total = db.execute(f"select count(*) as total from claim where height % {shards_total} = {shard_num};").fetchone()[0]
     for num, claim in enumerate(db.execute(f"""
-SELECT claimtrie.claim_hash as is_controlling,
-       claimtrie.last_take_over_height,
-       (select group_concat(tag, ',,') from tag where tag.claim_hash in (claim.claim_hash, claim.reposted_claim_hash)) as tags,
-       (select group_concat(language, ' ') from language where language.claim_hash in (claim.claim_hash, claim.reposted_claim_hash)) as languages,
-       (select cr.has_source from claim cr where cr.claim_hash = claim.reposted_claim_hash) as reposted_has_source,
-       (select cr.claim_type from claim cr where cr.claim_hash = claim.reposted_claim_hash) as reposted_claim_type,
-       claim.*
-FROM claim LEFT JOIN claimtrie USING (claim_hash)
-WHERE claim.height % {shards_total} = {shard_num}
-ORDER BY claim.height desc
+        SELECT claimtrie.claim_hash as is_controlling,
+               claimtrie.last_take_over_height,
+               (select group_concat(tag, ',,') from tag where tag.claim_hash in (claim.claim_hash, claim.reposted_claim_hash)) as tags,
+               (select group_concat(language, ' ') from language where language.claim_hash in (claim.claim_hash, claim.reposted_claim_hash)) as languages,
+               cr.has_source as reposted_has_source,
+               cr.claim_type  as reposted_claim_type,
+               cr.stream_type as reposted_stream_type,
+               cr.media_type as reposted_media_type,
+               cr.duration as reposted_duration,
+               cr.fee_amount as reposted_fee_amount,
+               cr.fee_currency as reposted_fee_currency,
+               claim.*
+        FROM claim LEFT JOIN claimtrie USING (claim_hash) LEFT JOIN claim cr ON cr.claim_hash=claim.reposted_claim_hash
+        WHERE claim.height % {shards_total} = {shard_num}
+        ORDER BY claim.height desc
 """)):
         claim = dict(claim._asdict())
         claim['has_source'] = bool(claim.pop('reposted_has_source') or claim['has_source'])
+        claim['stream_type'] = claim.pop('reposted_stream_type') or claim['stream_type']
+        claim['media_type'] = claim.pop('reposted_media_type') or claim['media_type']
+        claim['fee_amount'] = claim.pop('reposted_fee_amount') or claim['fee_amount']
+        claim['fee_currency'] = claim.pop('reposted_fee_currency') or claim['fee_currency']
+        claim['duration'] = claim.pop('reposted_duration') or claim['duration']
         claim['censor_type'] = 0
-        claim['censoring_channel_hash'] = None
+        claim['censoring_channel_id'] = None
         claim['tags'] = claim['tags'].split(',,') if claim['tags'] else []
         claim['languages'] = claim['languages'].split(' ') if claim['languages'] else []
         if num % 10_000 == 0:
@@ -77,15 +86,10 @@ async def make_es_index(index=None):
 
 
 async def run(db_path, clients, blocks, shard, index_name='claims'):
-    def itsbusy(*_):
-        logging.info("shard %d: db is busy, retry", shard)
-        return True
-    db = apsw.Connection(db_path, flags=apsw.SQLITE_OPEN_READONLY | apsw.SQLITE_OPEN_URI)
-    db.setbusyhandler(itsbusy)
-    db.cursor().execute('pragma journal_mode=wal;')
-    db.cursor().execute('pragma temp_store=memory;')
-
-    producer = get_all(db.cursor(), shard, clients, limit=blocks, index_name=index_name)
+    db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False, uri=True)
+    db.execute('pragma journal_mode=wal;')
+    db.execute('pragma temp_store=memory;')
+    producer = get_all(db, shard, clients, limit=blocks, index_name=index_name)
     await asyncio.gather(*(consume(producer, index_name=index_name) for _ in range(min(8, clients))))
 
 

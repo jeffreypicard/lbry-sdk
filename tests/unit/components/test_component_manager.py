@@ -3,7 +3,7 @@ from lbry.testcase import AsyncioTestCase, AdvanceTimeTestCase
 
 from lbry.conf import Config
 from lbry.extras.daemon.componentmanager import ComponentManager
-from lbry.extras.daemon.components import DATABASE_COMPONENT, DHT_COMPONENT
+from lbry.extras.daemon.components import DATABASE_COMPONENT, DISK_SPACE_COMPONENT, DHT_COMPONENT
 from lbry.extras.daemon.components import HASH_ANNOUNCER_COMPONENT, UPNP_COMPONENT
 from lbry.extras.daemon.components import PEER_PROTOCOL_SERVER_COMPONENT, EXCHANGE_RATE_MANAGER_COMPONENT
 from lbry.extras.daemon import components
@@ -25,6 +25,7 @@ class TestComponentManager(AsyncioTestCase):
                 components.WalletComponent
             ],
             [
+                components.DiskSpaceComponent,
                 components.FileManagerComponent,
                 components.HashAnnouncerComponent,
                 components.PeerProtocolServerComponent,
@@ -152,7 +153,7 @@ class TestComponentManagerProperStart(AdvanceTimeTestCase):
         self.component_manager = ComponentManager(
             Config(),
             skip_components=[
-                DATABASE_COMPONENT, DHT_COMPONENT, HASH_ANNOUNCER_COMPONENT,
+                DATABASE_COMPONENT, DISK_SPACE_COMPONENT, DHT_COMPONENT, HASH_ANNOUNCER_COMPONENT,
                 PEER_PROTOCOL_SERVER_COMPONENT, UPNP_COMPONENT,
                 EXCHANGE_RATE_MANAGER_COMPONENT],
             wallet=FakeDelayedWallet,

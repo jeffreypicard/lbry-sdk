@@ -15,14 +15,13 @@ from asyncio import Event, sleep
 from collections import defaultdict
 from functools import partial
 
-from binascii import hexlify
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from elasticsearch import ConnectionTimeout
 from prometheus_client import Counter, Info, Histogram, Gauge
 
 import lbry
-from lbry.utils import LRUCacheWithMetrics
+from lbry.error import TooManyClaimSearchParametersError
 from lbry.build_info import BUILD, COMMIT_HASH, DOCKER_TAG
 from lbry.wallet.server.block_processor import LBRYBlockProcessor
 from lbry.wallet.server.db.writer import LBRYLevelDB
@@ -39,7 +38,6 @@ from lbry.wallet.server import text
 from lbry.wallet.server import util
 from lbry.wallet.server.hash import sha256, hash_to_hex_str, hex_str_to_hash, HASHX_LEN, Base58Error
 from lbry.wallet.server.daemon import DaemonError
-from lbry.wallet.server.peers import PeerManager
 if typing.TYPE_CHECKING:
     from lbry.wallet.server.env import Env
     from lbry.wallet.server.mempool import MemPool
@@ -185,7 +183,6 @@ class SessionManager:
         self.bp = bp
         self.daemon = daemon
         self.mempool = mempool
-        self.peer_mgr = PeerManager(env, db)
         self.shutdown_event = shutdown_event
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.servers: typing.Dict[str, asyncio.AbstractServer] = {}
@@ -209,7 +206,7 @@ class SessionManager:
         else:
             protocol_class = self.env.coin.SESSIONCLS
         protocol_factory = partial(protocol_class, self, self.db,
-                                   self.mempool, self.peer_mgr, kind)
+                                   self.mempool, kind)
 
         host, port = args[:2]
         try:
@@ -369,7 +366,7 @@ class SessionManager:
             'logged': logged,
             'paused': paused,
             'pid': os.getpid(),
-            'peers': self.peer_mgr.info(),
+            'peers': [],
             'requests': pending_requests,
             'method_counts': method_counts,
             'sessions': self.session_count(),
@@ -436,7 +433,7 @@ class SessionManager:
 
         real_name: "bch.electrumx.cash t50001 s50002" for example
         """
-        await self.peer_mgr.add_localRPC_peer(real_name)
+        await self._notify_peer(real_name)
         return f"peer '{real_name}' added"
 
     async def rpc_disconnect(self, session_ids):
@@ -487,7 +484,7 @@ class SessionManager:
 
     async def rpc_peers(self):
         """Return a list of data about server peers."""
-        return self.peer_mgr.rpc_data()
+        return self.env.peer_hubs
 
     async def rpc_query(self, items, limit):
         """Return a list of data about server peers."""
@@ -578,7 +575,6 @@ class SessionManager:
             # Peer discovery should start after the external servers
             # because we connect to ourself
             await asyncio.wait([
-                self.peer_mgr.discover_peers(),
                 self._clear_stale_sessions(),
                 self._log_sessions(),
                 self._manage_servers()
@@ -637,6 +633,15 @@ class SessionManager:
             limit = self.env.max_send // 97
             self.history_cache[hashX] = await self.db.limited_history(hashX, limit=limit)
         return self.history_cache[hashX]
+
+    def _notify_peer(self, peer):
+        notify_tasks = [
+            session.send_notification('blockchain.peers.subscribe', [peer])
+            for session in self.sessions.values() if session.subscribe_peers
+        ]
+        if notify_tasks:
+            self.logger.info(f'notify {len(notify_tasks)} sessions of new peers')
+            asyncio.create_task(asyncio.wait(notify_tasks))
 
     async def _notify_sessions(self, height, touched, new_touched):
         """Notify sessions about height changes and touched addresses."""
@@ -704,7 +709,7 @@ class SessionBase(RPCSession):
     request_handlers: typing.Dict[str, typing.Callable] = {}
     version = '0.5.7'
 
-    def __init__(self, session_mgr, db, mempool, peer_mgr, kind):
+    def __init__(self, session_mgr, db, mempool, kind):
         connection = JSONRPCConnection(JSONRPCAutoDetect)
         self.env = session_mgr.env
         super().__init__(connection=connection)
@@ -712,7 +717,6 @@ class SessionBase(RPCSession):
         self.session_mgr = session_mgr
         self.db = db
         self.mempool = mempool
-        self.peer_mgr = peer_mgr
         self.kind = kind  # 'RPC', 'TCP' etc.
         self.coin = self.env.coin
         self.anon_logs = self.env.anon_logs
@@ -904,6 +908,7 @@ class LBRYElectrumX(SessionBase):
             LBRYElectrumX.set_server_features(self.env)
         self.subscribe_headers = False
         self.subscribe_headers_raw = False
+        self.subscribe_peers = False
         self.connection.max_response_size = self.env.max_send
         self.hashX_subs = {}
         self.sv_seen = False
@@ -1022,7 +1027,13 @@ class LBRYElectrumX(SessionBase):
 
     async def claimtrie_search(self, **kwargs):
         if kwargs:
-            return await self.run_and_cache_query('search', kwargs)
+            try:
+                return await self.run_and_cache_query('search', kwargs)
+            except TooManyClaimSearchParametersError as err:
+                await asyncio.sleep(2)
+                self.logger.warning("Got an invalid query from %s, for %s with more than %d elements.",
+                                    self.peer_address()[0], err.key, err.limit)
+                return RPCError(1, str(err))
 
     async def claimtrie_resolve(self, *urls):
         if urls:
@@ -1084,7 +1095,8 @@ class LBRYElectrumX(SessionBase):
 
     async def peers_subscribe(self):
         """Return the server peers as a list of (ip, host, details) tuples."""
-        return self.peer_mgr.on_peers_subscribe(self.is_tor())
+        self.subscribe_peers = True
+        return self.env.peer_hubs
 
     async def address_status(self, hashX):
         """Returns an address status.
@@ -1327,11 +1339,7 @@ class LBRYElectrumX(SessionBase):
     async def banner(self):
         """Return the server banner text."""
         banner = f'You are connected to an {self.version} server.'
-
-        if self.is_tor():
-            banner_file = self.env.tor_banner_file
-        else:
-            banner_file = self.env.banner_file
+        banner_file = self.env.banner_file
         if banner_file:
             try:
                 with codecs.open(banner_file, 'r', 'utf-8') as f:

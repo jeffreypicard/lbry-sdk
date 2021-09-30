@@ -40,7 +40,7 @@ class Censor:
 
     def censor(self, row) -> bool:
         if self.is_censored(row):
-            censoring_channel_hash = row['censoring_channel_hash']
+            censoring_channel_hash = bytes.fromhex(row['censoring_channel_id'])[::-1]
             self.censored.setdefault(censoring_channel_hash, set())
             self.censored[censoring_channel_hash].add(row['tx_hash'])
             return True
@@ -151,6 +151,19 @@ class Outputs:
         )
 
     @classmethod
+    def from_grpc(cls, outputs: OutputsMessage) -> 'Outputs':
+        txs = set()
+        for txo_message in chain(outputs.txos, outputs.extra_txos):
+            if txo_message.WhichOneof('meta') == 'error':
+                continue
+            txs.add((hexlify(txo_message.tx_hash[::-1]).decode(), txo_message.height))
+        return cls(
+            outputs.txos, outputs.extra_txos, txs,
+            outputs.offset, outputs.total,
+            outputs.blocked, outputs.blocked_total
+        )
+
+    @classmethod
     def to_base64(cls, txo_rows, extra_txo_rows, offset=0, total=None, blocked=None) -> str:
         return base64.b64encode(cls.to_bytes(txo_rows, extra_txo_rows, offset, total, blocked)).decode()
 
@@ -179,7 +192,7 @@ class Outputs:
                 txo_message.error.code = ErrorMessage.NOT_FOUND
             elif isinstance(txo, ResolveCensoredError):
                 txo_message.error.code = ErrorMessage.BLOCKED
-                set_reference(txo_message.error.blocked.channel, extra_row_dict.get(txo.censor_hash))
+                set_reference(txo_message.error.blocked.channel, extra_row_dict.get(bytes.fromhex(txo.censor_id)[::-1]))
             return
         txo_message.tx_hash = txo['txo_hash'][:32]
         txo_message.nout, = struct.unpack('<I', txo['txo_hash'][32:])

@@ -10,6 +10,7 @@ import typing
 import random
 import hashlib
 import tracemalloc
+from decimal import Decimal
 from urllib.parse import urlencode, quote
 from typing import Callable, Optional, List
 from binascii import hexlify, unhexlify
@@ -36,27 +37,29 @@ from lbry.blob_exchange.downloader import download_blob
 from lbry.dht.peer import make_kademlia_peer
 from lbry.error import (
     DownloadSDTimeoutError, ComponentsNotStartedError, ComponentStartConditionNotMetError,
-    CommandDoesNotExistError
+    CommandDoesNotExistError, BaseError, WalletNotFoundError, WalletAlreadyLoadedError, WalletAlreadyExistsError,
+    ConflictingInputValueError, AlreadyPurchasedError, PrivateKeyNotFoundError, InputStringIsBlankError
 )
 from lbry.extras import system_info
 from lbry.extras.daemon import analytics
 from lbry.extras.daemon.components import WALLET_COMPONENT, DATABASE_COMPONENT, DHT_COMPONENT, BLOB_COMPONENT
-from lbry.extras.daemon.components import FILE_MANAGER_COMPONENT
+from lbry.extras.daemon.components import FILE_MANAGER_COMPONENT, DISK_SPACE_COMPONENT
 from lbry.extras.daemon.components import EXCHANGE_RATE_MANAGER_COMPONENT, UPNP_COMPONENT
 from lbry.extras.daemon.componentmanager import RequiredCondition
 from lbry.extras.daemon.componentmanager import ComponentManager
 from lbry.extras.daemon.json_response_encoder import JSONResponseEncoder
-from lbry.extras.daemon import comment_client
 from lbry.extras.daemon.undecorated import undecorated
 from lbry.extras.daemon.security import ensure_request_allowed
 from lbry.file_analysis import VideoFileAnalyzer
 from lbry.schema.claim import Claim
-from lbry.schema.url import URL
+from lbry.schema.url import URL, normalize_name
+from lbry.wallet.server.db.elasticsearch.constants import RANGE_FIELDS, REPLACEMENTS
+MY_RANGE_FIELDS = RANGE_FIELDS - {"limit_claims_per_channel"}
 
 if typing.TYPE_CHECKING:
     from lbry.blob.blob_manager import BlobManager
     from lbry.dht.node import Node
-    from lbry.extras.daemon.components import UPnPComponent
+    from lbry.extras.daemon.components import UPnPComponent, DiskSpaceManager
     from lbry.extras.daemon.exchange_rate_manager import ExchangeRateManager
     from lbry.extras.daemon.storage import SQLiteStorage
     from lbry.wallet import WalletManager, Ledger
@@ -167,6 +170,48 @@ def paginate_list(items: List, page: Optional[int], page_size: Optional[int]):
         "total_items": total_items,
         "page": page, "page_size": page_size
     }
+
+
+def fix_kwargs_for_hub(**kwargs):
+    repeated_fields = {"media_type", "stream_type", "claim_type"}
+    value_fields = {"tx_nout", "has_source", "is_signature_valid"}
+    opcodes = {'=': 0, '<=': 1, '>=': 2, '<': 3, '>': 4}
+    for key, value in list(kwargs.items()):
+        if value in (None, [], False):
+            kwargs.pop(key)
+            continue
+        if key in REPLACEMENTS:
+            kwargs[REPLACEMENTS[key]] = kwargs.pop(key)
+            key = REPLACEMENTS[key]
+
+        if key == "normalized_name":
+            kwargs[key] = normalize_name(value)
+        if key == "limit_claims_per_channel":
+            value = kwargs.pop("limit_claims_per_channel") or 0
+            if value > 0:
+                kwargs["limit_claims_per_channel"] = value
+        elif key == "invalid_channel_signature":
+            kwargs["is_signature_valid"] = {"value": not kwargs.pop("invalid_channel_signature")}
+        elif key == "has_no_source":
+            kwargs["has_source"] = {"value": not kwargs.pop("has_no_source")}
+        elif key in value_fields:
+            kwargs[key] = {"value": value} if not isinstance(value, dict) else value
+        elif key in repeated_fields and isinstance(value, str):
+            kwargs[key] = [value]
+        elif key in ("claim_id", "channel_id"):
+            kwargs[key] = {"invert": False, "value": [kwargs[key]]}
+        elif key in ("claim_ids", "channel_ids"):
+            kwargs[key[:-1]] = {"invert": False, "value": kwargs.pop(key)}
+        elif key == "not_channel_ids":
+            kwargs["channel_id"] = {"invert": True, "value": kwargs.pop("not_channel_ids")}
+        elif key in MY_RANGE_FIELDS:
+            operator = '='
+            if isinstance(value, str) and value[0] in opcodes:
+                operator_length = 2 if value[:2] in opcodes else 1
+                operator, value = value[:operator_length], value[operator_length:]
+            value = [str(value if key != 'fee_amount' else Decimal(value)*1000)]
+            kwargs[key] = {"op": opcodes[operator], "value": value}
+    return kwargs
 
 
 DHT_HAS_CONTACTS = "dht_has_contacts"
@@ -374,6 +419,10 @@ class Daemon(metaclass=JSONRPCServerType):
     @property
     def blob_manager(self) -> typing.Optional['BlobManager']:
         return self.component_manager.get_component(BLOB_COMPONENT)
+
+    @property
+    def disk_space_manager(self) -> typing.Optional['DiskSpaceManager']:
+        return self.component_manager.get_component(DISK_SPACE_COMPONENT)
 
     @property
     def upnp(self) -> typing.Optional['UPnPComponent']:
@@ -698,7 +747,10 @@ class Daemon(metaclass=JSONRPCServerType):
             raise
         except Exception as e:  # pylint: disable=broad-except
             self.failed_request_metric.labels(method=function_name).inc()
-            log.exception("error handling api request")
+            if not isinstance(e, BaseError):
+                log.exception("error handling api request")
+            else:
+                log.error("error handling api request: %s", e)
             return JSONRPCError.create_command_exception(
                 command=function_name, args=_args, kwargs=_kwargs, exception=e, traceback=format_exc()
             )
@@ -1103,6 +1155,7 @@ class Daemon(metaclass=JSONRPCServerType):
             if not stream:
                 raise DownloadSDTimeoutError(uri)
         except Exception as e:
+            # TODO: use error from lbry.error
             log.warning("Error downloading %s: %s", uri, str(e))
             return {"error": str(e)}
         return stream
@@ -1269,9 +1322,9 @@ class Daemon(metaclass=JSONRPCServerType):
         wallet_path = os.path.join(self.conf.wallet_dir, 'wallets', wallet_id)
         for wallet in self.wallet_manager.wallets:
             if wallet.id == wallet_id:
-                raise Exception(f"Wallet at path '{wallet_path}' already exists and is loaded.")
+                raise WalletAlreadyLoadedError(wallet_path)
         if os.path.exists(wallet_path):
-            raise Exception(f"Wallet at path '{wallet_path}' already exists, use 'wallet_add' to load wallet.")
+            raise WalletAlreadyExistsError(wallet_path)
 
         wallet = self.wallet_manager.import_wallet(wallet_path)
         if not wallet.accounts and create_account:
@@ -1304,9 +1357,9 @@ class Daemon(metaclass=JSONRPCServerType):
         wallet_path = os.path.join(self.conf.wallet_dir, 'wallets', wallet_id)
         for wallet in self.wallet_manager.wallets:
             if wallet.id == wallet_id:
-                raise Exception(f"Wallet at path '{wallet_path}' is already loaded.")
+                raise WalletAlreadyLoadedError(wallet_path)
         if not os.path.exists(wallet_path):
-            raise Exception(f"Wallet at path '{wallet_path}' was not found.")
+            raise WalletNotFoundError(wallet_path)
         wallet = self.wallet_manager.import_wallet(wallet_path)
         if self.ledger.network.is_connected:
             for account in wallet.accounts:
@@ -1491,7 +1544,7 @@ class Daemon(metaclass=JSONRPCServerType):
                     )
                 )
             else:
-                raise ValueError(f"Unsupported address: '{address}'")
+                raise ValueError(f"Unsupported address: '{address}'")  # TODO: use error from lbry.error
 
         tx = await Transaction.create(
             [], outputs, accounts, account
@@ -1693,9 +1746,9 @@ class Daemon(metaclass=JSONRPCServerType):
                 'change': {'gap': change_gap, 'maximum_uses_per_address': change_max_uses},
                 'receiving': {'gap': receiving_gap, 'maximum_uses_per_address': receiving_max_uses},
             }
-            for chain_name in address_changes:
+            for chain_name, changes in address_changes.items():
                 chain = getattr(account, chain_name)
-                for attr, value in address_changes[chain_name].items():
+                for attr, value in changes.items():
                     if value is not None:
                         setattr(chain, attr, value)
                         change_made = True
@@ -1769,8 +1822,10 @@ class Daemon(metaclass=JSONRPCServerType):
         from_account = wallet.get_account_or_default(from_account)
         amount = self.get_dewies_or_error('amount', amount) if amount else None
         if not isinstance(outputs, int):
+            # TODO: use error from lbry.error
             raise ValueError("--outputs must be an integer.")
         if everything and outputs > 1:
+            # TODO: use error from lbry.error
             raise ValueError("Using --everything along with --outputs is not supported.")
         return from_account.fund(
             to_account=to_account, amount=amount, everything=everything,
@@ -1985,7 +2040,7 @@ class Daemon(metaclass=JSONRPCServerType):
             --channel_claim_id=<channel_claim_id>  : (str) get file with matching channel claim id(s)
             --channel_name=<channel_name>          : (str) get file with matching channel name
             --claim_name=<claim_name>              : (str) get file with matching claim name
-            --blobs_in_stream<blobs_in_stream>     : (int) get file with matching blobs in stream
+            --blobs_in_stream=<blobs_in_stream>    : (int) get file with matching blobs in stream
             --download_path=<download_path>        : (str) get file with matching download path
             --uploading_to_reflector=<uploading_to_reflector> : (bool) get files currently uploading to reflector
             --is_fully_reflected=<is_fully_reflected>         : (bool) get files that have been uploaded to reflector
@@ -2041,10 +2096,12 @@ class Daemon(metaclass=JSONRPCServerType):
         """
 
         if status not in ['start', 'stop']:
+            # TODO: use error from lbry.error
             raise Exception('Status must be "start" or "stop".')
 
         streams = self.file_manager.get_filtered(**kwargs)
         if not streams:
+            # TODO: use error from lbry.error
             raise Exception(f'Unable to find a file for {kwargs}')
         stream = streams[0]
         if status == 'start' and not stream.running:
@@ -2227,20 +2284,21 @@ class Daemon(metaclass=JSONRPCServerType):
         if claim_id:
             txo = await self.ledger.get_claim_by_claim_id(accounts, claim_id, include_purchase_receipt=True)
             if not isinstance(txo, Output) or not txo.is_claim:
-                raise Exception(f"Could not find claim with claim_id '{claim_id}'. ")
+                # TODO: use error from lbry.error
+                raise Exception(f"Could not find claim with claim_id '{claim_id}'.")
         elif url:
             txo = (await self.ledger.resolve(accounts, [url], include_purchase_receipt=True))[url]
             if not isinstance(txo, Output) or not txo.is_claim:
-                raise Exception(f"Could not find claim with url '{url}'. ")
+                # TODO: use error from lbry.error
+                raise Exception(f"Could not find claim with url '{url}'.")
         else:
-            raise Exception(f"Missing argument claim_id or url. ")
+            # TODO: use error from lbry.error
+            raise Exception("Missing argument claim_id or url.")
         if not allow_duplicate_purchase and txo.purchase_receipt:
-            raise Exception(
-                f"You already have a purchase for claim_id '{claim_id}'. "
-                f"Use --allow-duplicate-purchase flag to override."
-            )
+            raise AlreadyPurchasedError(claim_id)
         claim = txo.claim
         if not claim.is_stream or not claim.stream.has_fee:
+            # TODO: use error from lbry.error
             raise Exception(f"Claim '{claim_id}' does not have a purchase price.")
         tx = await self.wallet_manager.create_purchase_transaction(
             accounts, txo, self.exchange_rate_manager, override_max_key_fee
@@ -2294,9 +2352,9 @@ class Daemon(metaclass=JSONRPCServerType):
     async def jsonrpc_support_sum(self, claim_id, new_sdk_server, include_channel_content=False, **kwargs):
         """
         List total staked supports for a claim, grouped by the channel that signed the support.
-+
-+       If claim_id is a channel claim, you can use --include_channel_content to also include supports for
-+       content claims in the channel.
+
+        If claim_id is a channel claim, you can use --include_channel_content to also include supports for
+        content claims in the channel.
 
         !!!! NOTE: PAGINATION DOES NOT DO ANYTHING AT THE MOMENT !!!!!
 
@@ -2478,16 +2536,33 @@ class Daemon(metaclass=JSONRPCServerType):
 
         Returns: {Paginated[Output]}
         """
-        wallet = self.wallet_manager.get_wallet_or_default(kwargs.pop('wallet_id', None))
-        if {'claim_id', 'claim_ids'}.issubset(kwargs):
-            raise ValueError("Only 'claim_id' or 'claim_ids' is allowed, not both.")
-        if kwargs.pop('valid_channel_signature', False):
-            kwargs['signature_valid'] = 1
-        if kwargs.pop('invalid_channel_signature', False):
-            kwargs['signature_valid'] = 0
-        if 'has_no_source' in kwargs:
-            kwargs['has_source'] = not kwargs.pop('has_no_source')
+        if self.ledger.config.get('use_go_hub'):
+            host = self.ledger.network.client.server[0]
+            port = "50051"
+            kwargs['new_sdk_server'] = f"{host}:{port}"
+            if kwargs.get("channel"):
+                channel = kwargs.pop("channel")
+                channel_obj = (await self.jsonrpc_resolve(channel))[channel]
+                if isinstance(channel_obj, dict):
+                    # This happens when the channel doesn't exist
+                    kwargs["channel_id"] = ""
+                else:
+                    kwargs["channel_id"] = channel_obj.claim_id
+            kwargs = fix_kwargs_for_hub(**kwargs)
+        else:
+            # Don't do this if using the hub server, it screws everything up
+            if "claim_ids" in kwargs and not kwargs["claim_ids"]:
+                kwargs.pop("claim_ids")
+            if {'claim_id', 'claim_ids'}.issubset(kwargs):
+                raise ConflictingInputValueError('claim_id', 'claim_ids')
+            if kwargs.pop('valid_channel_signature', False):
+                kwargs['signature_valid'] = 1
+            if kwargs.pop('invalid_channel_signature', False):
+                kwargs['signature_valid'] = 0
+            if 'has_no_source' in kwargs:
+                kwargs['has_source'] = not kwargs.pop('has_no_source')
         page_num, page_size = abs(kwargs.pop('page', 1)), min(abs(kwargs.pop('page_size', DEFAULT_PAGE_SIZE)), 50)
+        wallet = self.wallet_manager.get_wallet_or_default(kwargs.pop('wallet_id', None))
         kwargs.update({'offset': page_size * (page_num - 1), 'limit': page_size})
         txos, blocked, _, total = await self.ledger.claim_search(wallet.accounts, **kwargs)
         result = {
@@ -2599,6 +2674,7 @@ class Daemon(metaclass=JSONRPCServerType):
         existing_channels = await self.ledger.get_channels(accounts=wallet.accounts, claim_name=name)
         if len(existing_channels) > 0:
             if not allow_duplicate_name:
+                # TODO: use error from lbry.error
                 raise Exception(
                     f"You already have a channel under the name '{name}'. "
                     f"Use --allow-duplicate-name flag to override."
@@ -2731,11 +2807,13 @@ class Daemon(metaclass=JSONRPCServerType):
         )
         if len(existing_channels) != 1:
             account_ids = ', '.join(f"'{account.id}'" for account in accounts)
+            # TODO: use error from lbry.error
             raise Exception(
                 f"Can't find the channel '{claim_id}' in account(s) {account_ids}."
             )
         old_txo = existing_channels[0]
         if not old_txo.claim.is_channel:
+            # TODO: use error from lbry.error
             raise Exception(
                 f"A claim with id '{claim_id}' was found but it is not a channel."
             )
@@ -2814,7 +2892,12 @@ class Daemon(metaclass=JSONRPCServerType):
         signing_channel = await self.get_channel_or_error(
             wallet, channel_account_id, channel_id, channel_name, for_signing=True
         )
-        return comment_client.sign(signing_channel, unhexlify(hexdata))
+        timestamp = str(int(time.time()))
+        signature = signing_channel.sign_data(unhexlify(hexdata), timestamp)
+        return {
+            'signature': signature,
+            'signing_ts': timestamp
+        }
 
     @requires(WALLET_COMPONENT)
     async def jsonrpc_channel_abandon(
@@ -2858,9 +2941,11 @@ class Daemon(metaclass=JSONRPCServerType):
                 wallet=wallet, accounts=accounts, claim_id=claim_id
             )
         else:
+            # TODO: use error from lbry.error
             raise Exception('Must specify claim_id, or txid and nout')
 
         if not claims:
+            # TODO: use error from lbry.error
             raise Exception('No claim found for the specified claim_id or txid:nout')
 
         tx = await Transaction.create(
@@ -2929,6 +3014,7 @@ class Daemon(metaclass=JSONRPCServerType):
         address = channel.get_address(self.ledger)
         public_key = await self.ledger.get_public_key_for_address(wallet, address)
         if not public_key:
+            # TODO: use error from lbry.error
             raise Exception("Can't find public key for address holding the channel.")
         export = {
             'name': channel.claim_name,
@@ -2990,6 +3076,7 @@ class Daemon(metaclass=JSONRPCServerType):
                     await self.ledger._update_tasks.done.wait()
             # Case 3: the holding address has changed and we can't create or find an account for it
             else:
+                # TODO: use error from lbry.error
                 raise Exception(
                     "Channel owning account has changed since the channel was exported and "
                     "it is not an account to which you have access."
@@ -3115,11 +3202,13 @@ class Daemon(metaclass=JSONRPCServerType):
         )
         if len(claims) == 0:
             if 'bid' not in kwargs:
+                # TODO: use error from lbry.error
                 raise Exception("'bid' is a required argument for new publishes.")
             return await self.jsonrpc_stream_create(name, **kwargs)
         elif len(claims) == 1:
             assert claims[0].claim.is_stream, f"Claim at name '{name}' is not a stream claim."
             return await self.jsonrpc_stream_update(claims[0].claim_id, replace=True, **kwargs)
+        # TODO: use error from lbry.error
         raise Exception(
             f"There are {len(claims)} claims for '{name}', please use 'stream update' command "
             f"to update a specific stream claim."
@@ -3171,11 +3260,13 @@ class Daemon(metaclass=JSONRPCServerType):
         claims = await account.get_claims(claim_name=name)
         if len(claims) > 0:
             if not allow_duplicate_name:
+                # TODO: use error from lbry.error
                 raise Exception(
                     f"You already have a stream claim published under the name '{name}'. "
                     f"Use --allow-duplicate-name flag to override."
                 )
         if not VALID_FULL_CLAIM_ID.fullmatch(claim_id):
+            # TODO: use error from lbry.error
             raise Exception('Invalid claim id. It is expected to be a 40 characters long hexadecimal string.')
 
         claim = Claim()
@@ -3319,6 +3410,7 @@ class Daemon(metaclass=JSONRPCServerType):
         claims = await account.get_claims(claim_name=name)
         if len(claims) > 0:
             if not allow_duplicate_name:
+                # TODO: use error from lbry.error
                 raise Exception(
                     f"You already have a stream claim published under the name '{name}'. "
                     f"Use --allow-duplicate-name flag to override."
@@ -3502,11 +3594,13 @@ class Daemon(metaclass=JSONRPCServerType):
         )
         if len(existing_claims) != 1:
             account_ids = ', '.join(f"'{account.id}'" for account in accounts)
+            # TODO: use error from lbry.error
             raise Exception(
                 f"Can't find the stream '{claim_id}' in account(s) {account_ids}."
             )
         old_txo = existing_claims[0]
         if not old_txo.claim.is_stream:
+            # TODO: use error from lbry.error
             raise Exception(
                 f"A claim with id '{claim_id}' was found but it is not a stream claim."
             )
@@ -3634,9 +3728,11 @@ class Daemon(metaclass=JSONRPCServerType):
                 wallet=wallet, accounts=accounts, claim_id=claim_id
             )
         else:
+            # TODO: use error from lbry.error
             raise Exception('Must specify claim_id, or txid and nout')
 
         if not claims:
+            # TODO: use error from lbry.error
             raise Exception('No claim found for the specified claim_id or txid:nout')
 
         tx = await Transaction.create(
@@ -3798,6 +3894,7 @@ class Daemon(metaclass=JSONRPCServerType):
         existing_collections = await self.ledger.get_collections(accounts=wallet.accounts, claim_name=name)
         if len(existing_collections) > 0:
             if not allow_duplicate_name:
+                # TODO: use error from lbry.error
                 raise Exception(
                     f"You already have a collection under the name '{name}'. "
                     f"Use --allow-duplicate-name flag to override."
@@ -3921,11 +4018,13 @@ class Daemon(metaclass=JSONRPCServerType):
         )
         if len(existing_collections) != 1:
             account_ids = ', '.join(f"'{account.id}'" for account in accounts)
+            # TODO: use error from lbry.error
             raise Exception(
                 f"Can't find the collection '{claim_id}' in account(s) {account_ids}."
             )
         old_txo = existing_collections[0]
         if not old_txo.claim.is_collection:
+            # TODO: use error from lbry.error
             raise Exception(
                 f"A claim with id '{claim_id}' was found but it is not a collection."
             )
@@ -4051,13 +4150,16 @@ class Daemon(metaclass=JSONRPCServerType):
         if claim_id:
             txo = await self.ledger.get_claim_by_claim_id(wallet.accounts, claim_id)
             if not isinstance(txo, Output) or not txo.is_claim:
-                raise Exception(f"Could not find collection with claim_id '{claim_id}'. ")
+                # TODO: use error from lbry.error
+                raise Exception(f"Could not find collection with claim_id '{claim_id}'.")
         elif url:
             txo = (await self.ledger.resolve(wallet.accounts, [url]))[url]
             if not isinstance(txo, Output) or not txo.is_claim:
-                raise Exception(f"Could not find collection with url '{url}'. ")
+                # TODO: use error from lbry.error
+                raise Exception(f"Could not find collection with url '{url}'.")
         else:
-            raise Exception(f"Missing argument claim_id or url. ")
+            # TODO: use error from lbry.error
+            raise Exception("Missing argument claim_id or url.")
 
         page_num, page_size = abs(page), min(abs(page_size), 50)
         items = await self.ledger.resolve_collection(txo, page_size * (page_num - 1), page_size)
@@ -4231,9 +4333,11 @@ class Daemon(metaclass=JSONRPCServerType):
                 wallet=wallet, accounts=accounts, claim_id=claim_id
             )
         else:
+            # TODO: use error from lbry.error
             raise Exception('Must specify claim_id, or txid and nout')
 
         if not supports:
+            # TODO: use error from lbry.error
             raise Exception('No supports found for the specified claim_id or txid:nout')
 
         if keep is not None:
@@ -4468,6 +4572,7 @@ class Daemon(metaclass=JSONRPCServerType):
             elif order_by in ('height', 'amount', 'none'):
                 constraints['order_by'] = order_by
             else:
+                # TODO: use error from lbry.error
                 raise ValueError(f"'{order_by}' is not a valid --order_by value.")
         self._constrain_txo_from_kwargs(constraints, **kwargs)
         return paginate_rows(claims, None if no_totals else claim_count, page, page_size, **constraints)
@@ -4774,10 +4879,12 @@ class Daemon(metaclass=JSONRPCServerType):
         """
 
         if not is_valid_blobhash(blob_hash):
+            # TODO: use error from lbry.error
             raise Exception("invalid blob hash")
         if search_bottom_out_limit is not None:
             search_bottom_out_limit = int(search_bottom_out_limit)
             if search_bottom_out_limit <= 0:
+                # TODO: use error from lbry.error
                 raise Exception("invalid bottom out limit")
         else:
             search_bottom_out_limit = 4
@@ -4821,12 +4928,14 @@ class Daemon(metaclass=JSONRPCServerType):
             blob_hashes.append(blob_hash)
         elif stream_hash or sd_hash:
             if sd_hash and stream_hash:
+                # TODO: use error from lbry.error
                 raise Exception("either the sd hash or the stream hash should be provided, not both")
             if sd_hash:
                 stream_hash = await self.storage.get_stream_hash_for_sd_hash(sd_hash)
             blobs = await self.storage.get_blobs_for_stream(stream_hash, only_completed=True)
             blob_hashes.extend(blob.blob_hash for blob in blobs if blob.blob_hash is not None)
         else:
+            # TODO: use error from lbry.error
             raise Exception('single argument must be specified')
         await self.storage.should_single_announce_blobs(blob_hashes, immediate=True)
         return True
@@ -4913,6 +5022,22 @@ class Daemon(metaclass=JSONRPCServerType):
         """
 
         raise NotImplementedError()
+
+    @requires(DISK_SPACE_COMPONENT)
+    async def jsonrpc_blob_clean(self):
+        """
+        Deletes blobs to cleanup disk space
+
+        Usage:
+            blob_clean
+
+        Options:
+            None
+
+        Returns:
+            (bool) true if successful
+        """
+        return await self.disk_space_manager.clean()
 
     @requires(FILE_MANAGER_COMPONENT)
     async def jsonrpc_file_reflect(self, **kwargs):
@@ -5007,7 +5132,7 @@ class Daemon(metaclass=JSONRPCServerType):
             'buckets': {}
         }
 
-        for i in range(len(self.dht_node.protocol.routing_table.buckets)):
+        for i, _ in enumerate(self.dht_node.protocol.routing_table.buckets):
             result['buckets'][i] = []
             for peer in self.dht_node.protocol.routing_table.buckets[i].peers:
                 host = {
@@ -5077,6 +5202,7 @@ class Daemon(metaclass=JSONRPCServerType):
             }
         """
         if not tracemalloc.is_tracing():
+            # TODO: use error from lbry.error
             raise Exception("Enable tracemalloc first! See 'tracemalloc set' command.")
         stats = tracemalloc.take_snapshot().filter_traces((
             tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
@@ -5100,439 +5226,6 @@ class Daemon(metaclass=JSONRPCServerType):
                 break
         return results
 
-    COMMENT_DOC = """
-    View, create and abandon comments.
-    """
-
-    async def jsonrpc_comment_list(self, claim_id, parent_id=None, page=1, page_size=50,
-                                   include_replies=False, skip_validation=False,
-                                   is_channel_signature_valid=False, hidden=False, visible=False):
-        """
-        List comments associated with a claim.
-
-        Usage:
-            comment_list    (<claim_id> | --claim_id=<claim_id>)
-                            [(--page=<page> --page_size=<page_size>)]
-                            [--parent_id=<parent_id>] [--include_replies]
-                            [--skip_validation] [--is_channel_signature_valid]
-                            [--visible | --hidden]
-
-        Options:
-            --claim_id=<claim_id>           : (str) The claim on which the comment will be made on
-            --parent_id=<parent_id>         : (str) CommentId of a specific thread you'd like to see
-            --page=<page>                   : (int) The page you'd like to see in the comment list.
-            --page_size=<page_size>         : (int) The amount of comments that you'd like to retrieve
-            --skip_validation               : (bool) Skip resolving comments to validate channel names
-            --include_replies               : (bool) Whether or not you want to include replies in list
-            --is_channel_signature_valid    : (bool) Only include comments with valid signatures.
-                                              [Warning: Paginated total size will not change, even
-                                               if list reduces]
-            --visible                       : (bool) Select only Visible Comments
-            --hidden                        : (bool) Select only Hidden Comments
-
-        Returns:
-            (dict)  Containing the list, and information about the paginated content:
-            {
-                "page": "Page number of the current items.",
-                "page_size": "Number of items to show on a page.",
-                "total_pages": "Total number of pages.",
-                "total_items": "Total number of items.",
-                "items": "A List of dict objects representing comments."
-                [
-                    {
-                        "comment":      (str) The actual string as inputted by the user,
-                        "comment_id":   (str) The Comment's unique identifier,
-                        "channel_name": (str) Name of the channel this was posted under, prepended with a '@',
-                        "channel_id":   (str) The Channel Claim ID that this comment was posted under,
-                        "signature":    (str) The signature of the comment,
-                        "channel_url":  (str) Channel's URI in the ClaimTrie,
-                        "parent_id":    (str) Comment this is replying to, (None) if this is the root,
-                        "timestamp":    (int) The time at which comment was entered into the server at, in nanoseconds.
-                    },
-                    ...
-                ]
-            }
-        """
-        if hidden ^ visible:
-            result = await comment_client.jsonrpc_post(
-                self.conf.comment_server,
-                'comment.List',
-                claim_id=claim_id,
-                visible=visible,
-                hidden=hidden,
-                page=page,
-                page_size=page_size
-            )
-        else:
-            result = await comment_client.jsonrpc_post(
-                self.conf.comment_server,
-                'comment.List',
-                claim_id=claim_id,
-                parent_id=parent_id,
-                page=page,
-                page_size=page_size,
-                top_level=not include_replies
-            )
-        if not skip_validation:
-            for comment in result.get('items', []):
-                channel_url = comment.get('channel_url')
-                if not channel_url:
-                    continue
-                resolve_response = await self.resolve([], [channel_url])
-                if isinstance(resolve_response[channel_url], Output):
-                    comment['is_channel_signature_valid'] = comment_client.is_comment_signed_by_channel(
-                        comment, resolve_response[channel_url]
-                    )
-                else:
-                    comment['is_channel_signature_valid'] = False
-            if is_channel_signature_valid:
-                result['items'] = [
-                    c for c in result.get('items', []) if c.get('is_channel_signature_valid', False)
-                ]
-        return result
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_create(self, comment, claim_id=None, parent_id=None, channel_account_id=None,
-                                     channel_name=None, channel_id=None, wallet_id=None):
-        """
-        Create and associate a comment with a claim using your channel identity.
-
-        Usage:
-            comment_create  (<comment> | --comment=<comment>)
-                            (<claim_id> | --claim_id=<claim_id>) [--parent_id=<parent_id>]
-                            (--channel_id=<channel_id> | --channel_name=<channel_name>)
-                            [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
-
-        Options:
-            --comment=<comment>                         : (str) Comment to be made, should be at most 2000 characters.
-            --claim_id=<claim_id>                       : (str) The ID of the claim to comment on
-            --parent_id=<parent_id>                     : (str) The ID of a comment to make a response to
-            --channel_id=<channel_id>                   : (str) The ID of the channel you want to post under
-            --channel_name=<channel_name>               : (str) The channel you want to post as, prepend with a '@'
-            --channel_account_id=<channel_account_id>   : (str) one or more account ids for accounts to look in
-                                                          for channel certificates, defaults to all accounts
-            --wallet_id=<wallet_id>                     : (str) restrict operation to specific wallet
-
-        Returns:
-            (dict) Comment object if successfully made, (None) otherwise
-            {
-                "comment":      (str) The actual string as inputted by the user,
-                "comment_id":   (str) The Comment's unique identifier,
-                "claim_id":     (str) The claim commented on,
-                "channel_name": (str) Name of the channel this was posted under, prepended with a '@',
-                "channel_id":   (str) The Channel Claim ID that this comment was posted under,
-                "is_pinned":    (boolean) Channel owner has pinned this comment,
-                "signature":    (str) The signature of the comment,
-                "signing_ts":   (str) The timestamp used to sign the comment,
-                "channel_url":  (str) Channel's URI in the ClaimTrie,
-                "parent_id":    (str) Comment this is replying to, (None) if this is the root,
-                "timestamp":    (int) The time at which comment was entered into the server at, in nanoseconds.
-            }
-        """
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-        channel = await self.get_channel_or_error(
-            wallet, channel_account_id, channel_id, channel_name, for_signing=True
-        )
-
-        comment_body = {
-            'comment': comment.strip(),
-            'claim_id': claim_id,
-            'parent_id': parent_id,
-            'channel_id': channel.claim_id,
-            'channel_name': channel.claim_name,
-        }
-        comment_client.sign_comment(comment_body, channel)
-
-        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Create', comment_body)
-        response.update({
-            'is_claim_signature_valid': comment_client.is_comment_signed_by_channel(response, channel)
-        })
-        return response
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_update(self, comment, comment_id, wallet_id=None):
-        """
-        Edit a comment published as one of your channels.
-
-        Usage:
-            comment_update (<comment> | --comment=<comment>)
-                         (<comment_id> | --comment_id=<comment_id>)
-                         [--wallet_id=<wallet_id>]
-
-        Options:
-            --comment=<comment>         : (str) New comment replacing the old one
-            --comment_id=<comment_id>   : (str) Hash identifying the comment to edit
-            --wallet_id=<wallet_id      : (str) restrict operation to specific wallet
-
-        Returns:
-            (dict) Comment object if edit was successful, (None) otherwise
-            {
-                "comment":      (str) The actual string as inputted by the user,
-                "comment_id":   (str) The Comment's unique identifier,
-                "claim_id":     (str) The claim commented on,
-                "channel_name": (str) Name of the channel this was posted under, prepended with a '@',
-                "channel_id":   (str) The Channel Claim ID that this comment was posted under,
-                "signature":    (str) The signature of the comment,
-                "signing_ts":   (str) Timestamp used to sign the most recent signature,
-                "channel_url":  (str) Channel's URI in the ClaimTrie,
-                "is_pinned":    (boolean) Channel owner has pinned this comment,
-                "parent_id":    (str) Comment this is replying to, (None) if this is the root,
-                "timestamp":    (int) The time at which comment was entered into the server at, in nanoseconds.
-            }
-        """
-        channel = await comment_client.jsonrpc_post(
-            self.conf.comment_server,
-            'comment.GetChannelFromCommentID',
-            comment_id=comment_id
-        )
-        if 'error' in channel:
-            raise ValueError(channel['error'])
-
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-        # channel = await self.get_channel_or_none(wallet, None, **channel)
-        channel_claim = await self.get_channel_or_error(wallet, [], **channel)
-        edited_comment = {
-            'comment_id': comment_id,
-            'comment': comment,
-            'channel_id': channel_claim.claim_id,
-            'channel_name': channel_claim.claim_name
-        }
-        comment_client.sign_comment(edited_comment, channel_claim)
-        return await comment_client.jsonrpc_post(
-            self.conf.comment_server, 'comment.Edit', edited_comment
-        )
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_abandon(self, comment_id, wallet_id=None):
-        """
-        Abandon a comment published under your channel identity.
-
-        Usage:
-            comment_abandon  (<comment_id> | --comment_id=<comment_id>) [--wallet_id=<wallet_id>]
-
-        Options:
-            --comment_id=<comment_id>   : (str) The ID of the comment to be abandoned.
-            --wallet_id=<wallet_id      : (str) restrict operation to specific wallet
-
-        Returns:
-            (dict) Object with the `comment_id` passed in as the key, and a flag indicating if it was abandoned
-            {
-                <comment_id> (str): {
-                    "abandoned": (bool)
-                }
-            }
-        """
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-        abandon_comment_body = {'comment_id': comment_id}
-        channel = await comment_client.jsonrpc_post(
-            self.conf.comment_server, 'comment.GetChannelFromCommentID', comment_id=comment_id
-        )
-        if 'error' in channel:
-            return {comment_id: {'abandoned': False}}
-        channel = await self.get_channel_or_none(wallet, None, **channel)
-        abandon_comment_body.update({
-            'channel_id': channel.claim_id,
-            'channel_name': channel.claim_name,
-        })
-        comment_client.sign_comment(abandon_comment_body, channel, sign_comment_id=True)
-        return await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Abandon', abandon_comment_body)
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_hide(self, comment_ids: typing.Union[str, list], wallet_id=None):
-        """
-        Hide a comment published to a claim you control.
-
-        Usage:
-            comment_hide  <comment_ids>... [--wallet_id=<wallet_id>]
-
-        Options:
-            --comment_ids=<comment_ids>  : (str, list) one or more comment_id to hide.
-            --wallet_id=<wallet_id>      : (str) restrict operation to specific wallet
-
-        Returns: lists containing the ids comments that are hidden and visible.
-
-            {
-                "hidden":   (list) IDs of hidden comments.
-                "visible":  (list) IDs of visible comments.
-            }
-        """
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-
-        if isinstance(comment_ids, str):
-            comment_ids = [comment_ids]
-
-        comments = await comment_client.jsonrpc_post(
-            self.conf.comment_server, 'get_comments_by_id', comment_ids=comment_ids
-        )
-        comments = comments['items']
-        claim_ids = {comment['claim_id'] for comment in comments}
-        claims = {cid: await self.ledger.get_claim_by_claim_id(wallet.accounts, claim_id=cid) for cid in claim_ids}
-        pieces = []
-        for comment in comments:
-            claim = claims.get(comment['claim_id'])
-            if claim:
-                channel = await self.get_channel_or_none(
-                    wallet,
-                    account_ids=[],
-                    channel_id=claim.channel.claim_id,
-                    channel_name=claim.channel.claim_name,
-                    for_signing=True
-                )
-                piece = {'comment_id': comment['comment_id']}
-                comment_client.sign_comment(piece, channel, sign_comment_id=True)
-                pieces.append(piece)
-        return await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Hide', pieces=pieces)
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_pin(self, comment_id=None, channel_id=None, channel_name=None,
-                                  channel_account_id=None, remove=False, wallet_id=None):
-        """
-        Pin a comment published to a claim you control.
-
-        Usage:
-            comment_pin     (<comment_id> | --comment_id=<comment_id>)
-                            (--channel_id=<channel_id>)
-                            (--channel_name=<channel_name>)
-                            [--remove]
-                            [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
-
-        Options:
-            --comment_id=<comment_id>   : (str) Hash identifying the comment to pin
-            --channel_id=<claim_id>                     : (str) The ID of channel owning the commented claim
-            --channel_name=<claim_name>                 : (str) The name of channel owning the commented claim
-            --remove                                    : (bool) remove the pin
-            --channel_account_id=<channel_account_id>   : (str) one or more account ids for accounts to look in
-            --wallet_id=<wallet_id                      : (str) restrict operation to specific wallet
-
-        Returns: lists containing the ids comments that are hidden and visible.
-
-            {
-                "hidden":   (list) IDs of hidden comments.
-                "visible":  (list) IDs of visible comments.
-            }
-        """
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-        channel = await self.get_channel_or_error(
-            wallet, channel_account_id, channel_id, channel_name, for_signing=True
-        )
-        comment_pin_args = {
-            'comment_id': comment_id,
-            'channel_name': channel_name,
-            'channel_id': channel_id,
-            'remove': remove,
-        }
-        comment_client.sign_comment(comment_pin_args, channel, sign_comment_id=True)
-        return await comment_client.jsonrpc_post(self.conf.comment_server, 'comment.Pin', comment_pin_args)
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_react(
-            self, comment_ids, channel_name=None, channel_id=None,
-            channel_account_id=None, remove=False, clear_types=None, react_type=None, wallet_id=None):
-        """
-        Create and associate a reaction emoji with a comment using your channel identity.
-
-        Usage:
-            comment_react   (--comment_ids=<comment_ids>)
-                            (--channel_id=<channel_id>)
-                            (--channel_name=<channel_name>)
-                            (--react_type=<react_type>)
-                            [(--remove) | (--clear_types=<clear_types>)]
-                            [--channel_account_id=<channel_account_id>...] [--wallet_id=<wallet_id>]
-
-        Options:
-            --comment_ids=<comment_ids>                 : (str) one or more comment id reacted to, comma delimited
-            --channel_id=<claim_id>                     : (str) The ID of channel reacting
-            --channel_name=<claim_name>                 : (str) The name of the channel reacting
-            --wallet_id=<wallet_id>                     : (str) restrict operation to specific wallet
-            --channel_account_id=<channel_account_id>   : (str) one or more account ids for accounts to look in
-            --react_type=<react_type>                   : (str) name of reaction type
-            --remove                                    : (bool) remove specified react_type
-            --clear_types=<clear_types>                 : (str) types to clear when adding another type
-
-
-        Returns:
-            (dict) Reaction object if successfully made, (None) otherwise
-            {
-            "Reactions": {
-                <comment_id>: {
-                    <reaction_type>: (int) Count for this reaction
-                    ...
-                }
-            }
-        """
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-        channel = await self.get_channel_or_error(
-            wallet, channel_account_id, channel_id, channel_name, for_signing=True
-        )
-
-        react_body = {
-            'comment_ids': comment_ids,
-            'channel_id': channel_id,
-            'channel_name': channel.claim_name,
-            'type': react_type,
-            'remove': remove,
-            'clear_types': clear_types,
-        }
-        comment_client.sign_reaction(react_body, channel)
-
-        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'reaction.React', react_body)
-
-        return response
-
-    @requires(WALLET_COMPONENT)
-    async def jsonrpc_comment_react_list(
-            self, comment_ids, channel_name=None, channel_id=None,
-            channel_account_id=None, react_types=None, wallet_id=None):
-        """
-        List reactions emoji with a claim using your channel identity.
-
-        Usage:
-            comment_react_list  (--comment_ids=<comment_ids>)
-                                [(--channel_id=<channel_id>)(--channel_name=<channel_name>)]
-                                [--react_types=<react_types>]
-
-        Options:
-            --comment_ids=<comment_ids>                 : (str) The comment ids reacted to, comma delimited
-            --channel_id=<claim_id>                     : (str) The ID of channel reacting
-            --channel_name=<claim_name>                 : (str) The name of the channel reacting
-            --wallet_id=<wallet_id>                     : (str) restrict operation to specific wallet
-            --react_types=<react_type>                   : (str) comma delimited reaction types
-
-        Returns:
-            (dict) Comment object if successfully made, (None) otherwise
-            {
-                "my_reactions": {
-                    <comment_id>: {
-                    <reaction_type>: (int) Count for this reaction type
-                    ...
-                    }
-                }
-                "other_reactions": {
-                    <comment_id>: {
-                    <reaction_type>: (int) Count for this reaction type
-                    ...
-                    }
-                }
-            }
-        """
-        wallet = self.wallet_manager.get_wallet_or_default(wallet_id)
-        react_list_body = {
-            'comment_ids': comment_ids,
-        }
-        if channel_id:
-            channel = await self.get_channel_or_error(
-                wallet, channel_account_id, channel_id, channel_name, for_signing=True
-            )
-            react_list_body['channel_id'] = channel_id
-            react_list_body['channel_name'] = channel.claim_name
-
-        if react_types:
-            react_list_body['types'] = react_types
-        if channel_id:
-            comment_client.sign_reaction(react_list_body, channel)
-        response = await comment_client.jsonrpc_post(self.conf.comment_server, 'reaction.List', react_list_body)
-        return response
-
     async def broadcast_or_release(self, tx, blocking=False):
         await self.wallet_manager.broadcast_or_release(tx, blocking)
 
@@ -5542,51 +5235,63 @@ class Daemon(metaclass=JSONRPCServerType):
                 allow_script_address and self.ledger.is_script_address(address)
             )
         except:
+            # TODO: use error from lbry.error
             raise Exception(f"'{address}' is not a valid address")
 
     @staticmethod
     def valid_stream_name_or_error(name: str):
         try:
             if not name:
-                raise Exception('Stream name cannot be blank.')
+                raise InputStringIsBlankError('Stream name')
             parsed = URL.parse(name)
             if parsed.has_channel:
+                # TODO: use error from lbry.error
                 raise Exception(
                     "Stream names cannot start with '@' symbol. This is reserved for channels claims."
                 )
             if not parsed.has_stream or parsed.stream.name != name:
+                # TODO: use error from lbry.error
                 raise Exception('Stream name has invalid characters.')
         except (TypeError, ValueError):
+            # TODO: use error from lbry.error
             raise Exception("Invalid stream name.")
 
     @staticmethod
     def valid_collection_name_or_error(name: str):
         try:
             if not name:
+                # TODO: use error from lbry.error
                 raise Exception('Collection name cannot be blank.')
             parsed = URL.parse(name)
             if parsed.has_channel:
+                # TODO: use error from lbry.error
                 raise Exception(
                     "Collection names cannot start with '@' symbol. This is reserved for channels claims."
                 )
             if not parsed.has_stream or parsed.stream.name != name:
+                # TODO: use error from lbry.error
                 raise Exception('Collection name has invalid characters.')
         except (TypeError, ValueError):
+            # TODO: use error from lbry.error
             raise Exception("Invalid collection name.")
 
     @staticmethod
     def valid_channel_name_or_error(name: str):
         try:
             if not name:
+                # TODO: use error from lbry.error
                 raise Exception(
                     "Channel name cannot be blank."
                 )
             parsed = URL.parse(name)
             if not parsed.has_channel:
+                # TODO: use error from lbry.error
                 raise Exception("Channel names must start with '@' symbol.")
             if parsed.channel.name != name:
+                # TODO: use error from lbry.error
                 raise Exception("Channel name has invalid character")
         except (TypeError, ValueError):
+            # TODO: use error from lbry.error
             raise Exception("Invalid channel name.")
 
     def get_fee_address(self, kwargs: dict, claim_address: str) -> str:
@@ -5618,6 +5323,7 @@ class Daemon(metaclass=JSONRPCServerType):
         elif channel_name:
             key, value = 'name', channel_name
         else:
+            # TODO: use error from lbry.error
             raise ValueError("Couldn't find channel because a channel_id or channel_name was not provided.")
         channels = await self.ledger.get_channels(
             wallet=wallet, accounts=wallet.get_accounts_or_all(account_ids),
@@ -5625,13 +5331,16 @@ class Daemon(metaclass=JSONRPCServerType):
         )
         if len(channels) == 1:
             if for_signing and not channels[0].has_private_key:
-                raise Exception(f"Couldn't find private key for {key} '{value}'. ")
+                # TODO: use error from lbry.error
+                raise PrivateKeyNotFoundError(key, value)
             return channels[0]
         elif len(channels) > 1:
+            # TODO: use error from lbry.error
             raise ValueError(
                 f"Multiple channels found with channel_{key} '{value}', "
                 f"pass a channel_id to narrow it down."
             )
+        # TODO: use error from lbry.error
         raise ValueError(f"Couldn't find channel with channel_{key} '{value}'.")
 
     @staticmethod
@@ -5639,9 +5348,11 @@ class Daemon(metaclass=JSONRPCServerType):
         try:
             dewies = lbc_to_dewies(lbc)
             if positive_value and dewies <= 0:
+                # TODO: use error from lbry.error
                 raise ValueError(f"'{argument}' value must be greater than 0.0")
             return dewies
         except ValueError as e:
+            # TODO: use error from lbry.error
             raise ValueError(f"Invalid value for '{argument}': {e.args[0]}")
 
     async def resolve(self, accounts, urls, **kwargs):

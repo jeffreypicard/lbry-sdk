@@ -15,6 +15,7 @@ from lbry.dht.node import Node
 from lbry.dht.peer import is_valid_public_ipv4
 from lbry.dht.blob_announcer import BlobAnnouncer
 from lbry.blob.blob_manager import BlobManager
+from lbry.blob.disk_space_manager import DiskSpaceManager
 from lbry.blob_exchange.server import BlobServer
 from lbry.stream.stream_manager import StreamManager
 from lbry.file.file_manager import FileManager
@@ -40,6 +41,7 @@ WALLET_SERVER_PAYMENTS_COMPONENT = "wallet_server_payments"
 DHT_COMPONENT = "dht"
 HASH_ANNOUNCER_COMPONENT = "hash_announcer"
 FILE_MANAGER_COMPONENT = "file_manager"
+DISK_SPACE_COMPONENT = "disk_space"
 PEER_PROTOCOL_SERVER_COMPONENT = "peer_protocol_server"
 UPNP_COMPONENT = "upnp"
 EXCHANGE_RATE_MANAGER_COMPONENT = "exchange_rate_manager"
@@ -59,7 +61,7 @@ class DatabaseComponent(Component):
 
     @staticmethod
     def get_current_db_revision():
-        return 14
+        return 15
 
     @property
     def revision_filename(self):
@@ -138,7 +140,7 @@ class WalletComponent(Component):
                     'availability': session.available,
                 } for session in sessions
             ],
-            'known_servers': len(self.wallet_manager.ledger.network.config['default_servers']),
+            'known_servers': len(self.wallet_manager.ledger.network.known_hubs),
             'available_servers': 1 if is_connected else 0
         }
 
@@ -375,6 +377,36 @@ class FileManagerComponent(Component):
         self.file_manager.stop()
 
 
+class DiskSpaceComponent(Component):
+    component_name = DISK_SPACE_COMPONENT
+    depends_on = [DATABASE_COMPONENT, BLOB_COMPONENT]
+
+    def __init__(self, component_manager):
+        super().__init__(component_manager)
+        self.disk_space_manager: typing.Optional[DiskSpaceManager] = None
+
+    @property
+    def component(self) -> typing.Optional[DiskSpaceManager]:
+        return self.disk_space_manager
+
+    async def get_status(self):
+        if self.disk_space_manager:
+            return {
+                'space_used': str(await self.disk_space_manager.get_space_used_mb()),
+                'running': self.disk_space_manager.running,
+            }
+        return {'space_used': '0', 'running': False}
+
+    async def start(self):
+        db = self.component_manager.get_component(DATABASE_COMPONENT)
+        blob_manager = self.component_manager.get_component(BLOB_COMPONENT)
+        self.disk_space_manager = DiskSpaceManager(self.conf, db, blob_manager)
+        await self.disk_space_manager.start()
+
+    async def stop(self):
+        await self.disk_space_manager.stop()
+
+
 class TorrentComponent(Component):
     component_name = LIBTORRENT_COMPONENT
 
@@ -481,6 +513,10 @@ class UPnPComponent(Component):
             log.info("external ip changed from %s to %s", self.external_ip, external_ip)
         if external_ip:
             self.external_ip = external_ip
+            dht_component = self.component_manager.get_component(DHT_COMPONENT)
+            if dht_component:
+                dht_node = dht_component.component
+                dht_node.protocol.external_ip = external_ip
         # assert self.external_ip is not None   # TODO: handle going/starting offline
 
         if not self.upnp_redirects and self.upnp:  # setup missing redirects
